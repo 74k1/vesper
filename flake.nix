@@ -27,7 +27,7 @@
           pname = "vesper";
           version = "0.1.0";
           src = ./.;
-          cargoHash = "sha256-kWBB1uqX90goVCwNZ5a0Qs9/hkb5Jo8ERjLSng/Rg8Y=";
+          cargoHash = "sha256-9QCvoikM4VOQINHqFv0F5HyOy+TL2692abYDv428T8E=";
           # buildInputs = with pkgs; [ ];
           meta.mainProgram = "vesper";
         };
