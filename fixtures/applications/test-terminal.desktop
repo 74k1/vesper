@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Test Terminal App
+Exec=test-htop
+Terminal=true
+Icon=utilities-terminal

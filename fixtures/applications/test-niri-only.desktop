@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Test Niri Only
+Exec=test-niri-only
+OnlyShowIn=niri;sway;

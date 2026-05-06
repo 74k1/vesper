@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Test Multi-File Editor
+Exec=test-editor %F
+Terminal=false
+Icon=text-editor

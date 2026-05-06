@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Test TryExec Missing
+Exec=test-tryexec-missing
+TryExec=nonexistent-binary-xyz123

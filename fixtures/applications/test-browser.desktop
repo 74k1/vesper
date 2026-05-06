@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Test Browser
+Exec=test-browser %u
+Icon=web-browser
+Terminal=false

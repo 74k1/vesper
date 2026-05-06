@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Test Autostart
+Exec=test-autostart
+OnlyShowIn=niri;
+Terminal=false

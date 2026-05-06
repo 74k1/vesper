@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Test Escaped Spaces
+Exec=test-program "arg with spaces" --flag
+Terminal=false

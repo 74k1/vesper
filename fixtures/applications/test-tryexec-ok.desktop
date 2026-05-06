@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Test TryExec Present
+Exec=test-tryexec
+TryExec=ls

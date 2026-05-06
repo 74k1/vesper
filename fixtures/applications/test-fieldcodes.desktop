@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Test Field Codes
+Exec=test-fc --name=%c --desktop=%k --extra %f
+Path=/tmp
+Terminal=false
