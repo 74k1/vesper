@@ -6,8 +6,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eyre::{bail, Context, ContextCompat, Result};
 use clap::{Parser, Subcommand};
+use eyre::{bail, Context, ContextCompat, Result};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -94,7 +94,7 @@ struct DesktopEntry {
     path: PathBuf,
     /// The keys we care about, raw from the file
     raw: BTreeMap<String, String>,
-    /// Computed entry ID (basename without .desktop)
+    /// Computed entry ID (relative path without .desktop, with dirs joined by '-')
     id: String,
 }
 
@@ -123,18 +123,23 @@ impl DesktopEntry {
         if self.hidden() {
             return false;
         }
-        if let Some(d) = desktop {
-            let only = self.only_show_in();
-            if !only.is_empty() && !only.split(';').any(|s| s == d) {
-                return false;
-            }
-            let not = self.not_show_in();
-            if !not.is_empty() && not.split(';').any(|s| s == d) {
-                return false;
-            }
-        } else if !self.only_show_in().is_empty() {
+
+        let desktops: Vec<&str> = desktop
+            .unwrap_or("")
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let only = self.only_show_in();
+        if !only.is_empty() && (desktops.is_empty() || !desktop_list_matches(only, &desktops)) {
             return false;
         }
+
+        let not = self.not_show_in();
+        if !not.is_empty() && desktop_list_matches(not, &desktops) {
+            return false;
+        }
+
         true
     }
 
@@ -151,17 +156,51 @@ impl DesktopEntry {
 // Desktop file parsing
 // ---------------------------------------------------------------------------
 
+/// Compute the desktop entry ID for a file.
+fn desktop_entry_id(path: &Path, base_dir: Option<&Path>) -> String {
+    let mut id = if let Some(base) = base_dir {
+        path.strip_prefix(base)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('/', "-")
+    } else {
+        path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+
+    if let Some(stripped) = id.strip_suffix(".desktop") {
+        id = stripped.to_string();
+    }
+
+    id
+}
+
 /// Parse a .desktop file, extracting only keys from `[Desktop Entry]`.
 fn parse_desktop_file(path: &Path) -> Result<DesktopEntry> {
-    let f = fs::File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
+    parse_desktop_file_with_base(path, None)
+}
+
+/// Parse a .desktop file with an optional base dir for computing its entry ID.
+fn parse_desktop_file_with_base(path: &Path, base_dir: Option<&Path>) -> Result<DesktopEntry> {
+    let f = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let reader = BufReader::new(f);
 
     let mut in_entry = false;
     let mut raw = BTreeMap::new();
     let wanted: &[&str] = &[
-        "Type", "Name", "Exec", "URL", "Terminal", "TryExec", "Hidden",
-        "NoDisplay", "OnlyShowIn", "NotShowIn", "Path", "Icon",
+        "Type",
+        "Name",
+        "Exec",
+        "URL",
+        "Terminal",
+        "TryExec",
+        "Hidden",
+        "NoDisplay",
+        "OnlyShowIn",
+        "NotShowIn",
+        "Path",
+        "Icon",
     ];
 
     for line in reader.lines() {
@@ -193,10 +232,7 @@ fn parse_desktop_file(path: &Path) -> Result<DesktopEntry> {
         }
     }
 
-    let id = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let id = desktop_entry_id(path, base_dir);
 
     Ok(DesktopEntry {
         path: path.to_path_buf(),
@@ -241,7 +277,7 @@ fn discover_all() -> Vec<DesktopEntry> {
     // System dirs first
     for dir in &system_dirs {
         for f in discover_dir(dir) {
-            if let Ok(e) = parse_desktop_file(&f) {
+            if let Ok(e) = parse_desktop_file_with_base(&f, Some(dir)) {
                 seen.entry(e.id.clone()).or_insert(e);
             }
         }
@@ -249,7 +285,7 @@ fn discover_all() -> Vec<DesktopEntry> {
 
     // User dir overrides
     for f in discover_dir(&user_dir) {
-        if let Ok(e) = parse_desktop_file(&f) {
+        if let Ok(e) = parse_desktop_file_with_base(&f, Some(&user_dir)) {
             seen.insert(e.id.clone(), e);
         }
     }
@@ -262,23 +298,14 @@ fn find_entry(id_or_path: &str) -> Result<DesktopEntry> {
     let p = Path::new(id_or_path);
 
     // Direct path
-    if (p.is_absolute() || p.exists())
-        && p.extension().is_some_and(|e| e == "desktop")
-    {
+    if (p.is_absolute() || p.exists()) && p.extension().is_some_and(|e| e == "desktop") {
         return parse_desktop_file(p);
     }
 
-    // Look up by ID
+    // Look up by ID, accepting both "foo" and the full "foo.desktop" form.
+    let lookup_id = id_or_path.strip_suffix(".desktop").unwrap_or(id_or_path);
     for e in discover_all() {
-        if e.id == id_or_path {
-            return Ok(e);
-        }
-    }
-
-    // Try resolving by appending .desktop
-    let with_ext = format!("{}.desktop", id_or_path);
-    for e in discover_all() {
-        if e.id == with_ext || e.id == id_or_path {
+        if e.id == lookup_id {
             return Ok(e);
         }
     }
@@ -291,84 +318,80 @@ fn find_entry(id_or_path: &str) -> Result<DesktopEntry> {
 // ---------------------------------------------------------------------------
 
 fn autostart_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    // System autostart
-    for d in xdg_config_dirs() {
-        dirs.push(d.join("autostart"));
-    }
-
-    // User autostart
-    let user_autostart = env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            home_dir()
-                .map(|h| PathBuf::from(h).join(".config"))
-                .unwrap_or_default()
-        })
-        .join("autostart");
-    dirs.push(user_autostart);
-
+    // Lower-priority dirs first, higher-priority dirs later, so insert() lets
+    // user autostart files override system files with the same ID.
+    let mut dirs: Vec<PathBuf> = xdg_config_dirs()
+        .into_iter()
+        .map(|d| d.join("autostart"))
+        .collect();
+    dirs.reverse();
+    dirs.push(xdg_config_home().join("autostart"));
     dirs
 }
 
 fn autostart_entries(desktop: &str) -> Vec<DesktopEntry> {
+    collect_autostart_entries(&autostart_dirs(), desktop)
+}
+
+fn collect_autostart_entries(dirs: &[PathBuf], desktop: &str) -> Vec<DesktopEntry> {
     let mut seen: BTreeMap<String, DesktopEntry> = BTreeMap::new();
-    for dir in autostart_dirs() {
-        for f in discover_dir(&dir) {
-            if let Ok(e) = parse_desktop_file(&f) {
-                // Apply filters
-                if !e.visible_for(Some(desktop)) {
-                    continue;
-                }
-                // Skip non-Application entries (links have no Exec)
-                if e.type_() != "Application" {
-                    continue;
-                }
-                seen.entry(e.id.clone()).or_insert(e);
+    for dir in dirs {
+        for f in discover_dir(dir) {
+            if let Ok(e) = parse_desktop_file_with_base(&f, Some(dir)) {
+                seen.insert(e.id.clone(), e);
             }
         }
     }
-    seen.into_values().collect()
+
+    seen.into_values()
+        .filter(|e| e.visible_for(Some(desktop)))
+        .filter(|e| e.type_() == "Application")
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
 // Exec field-code expansion
 // ---------------------------------------------------------------------------
 
-/// Split an Exec value into tokens, respecting double-quotes.
+/// Split an Exec value into tokens, respecting double-quotes and backslash escapes.
 fn tokenize_exec(exec: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    let chars: Vec<char> = exec.chars().collect();
-    let mut i = 0;
+    let mut current = String::new();
+    let mut chars = exec.chars().peekable();
+    let mut in_quotes = false;
+    let mut in_token = false;
 
-    while i < chars.len() {
-        // Skip whitespace
-        if chars[i].is_whitespace() {
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '"' {
-            let mut s = String::new();
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                s.push(chars[i]);
-                i += 1;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                in_token = true;
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                } else {
+                    current.push('\\');
+                }
             }
-            if i < chars.len() {
-                i += 1; // closing quote
+            '"' => {
+                in_quotes = !in_quotes;
+                in_token = true;
             }
-            tokens.push(s);
-        } else {
-            let mut s = String::new();
-            while i < chars.len() && !chars[i].is_whitespace() {
-                s.push(chars[i]);
-                i += 1;
+            c if c.is_whitespace() && !in_quotes => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
             }
-            tokens.push(s);
+            _ => {
+                in_token = true;
+                current.push(c);
+            }
         }
     }
+
+    if in_token {
+        tokens.push(current);
+    }
+
     tokens
 }
 
@@ -496,7 +519,43 @@ fn build_command(
 // Running
 // ---------------------------------------------------------------------------
 
-fn run_entry(entry: &DesktopEntry, terminal_cmd: &str, extra_args: &[String]) -> Result<()> {
+fn exec_has_field_code(exec: &str, code: char) -> bool {
+    let mut chars = exec.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('%') => continue,
+                Some(next) if next == code => return true,
+                Some(_) | None => {}
+            }
+        }
+    }
+    false
+}
+
+fn split_extra_args_for_exec(exec: &str, extra_args: &[String]) -> (Vec<String>, Vec<String>) {
+    let wants_files = exec_has_field_code(exec, 'f') || exec_has_field_code(exec, 'F');
+    let wants_urls = exec_has_field_code(exec, 'u') || exec_has_field_code(exec, 'U');
+
+    if wants_urls && !wants_files {
+        (Vec::new(), extra_args.to_vec())
+    } else {
+        (extra_args.to_vec(), Vec::new())
+    }
+}
+
+fn apply_entry_current_dir(cmd: &mut Command, entry: &DesktopEntry) {
+    if let Some(p) = entry.path_() {
+        let expanded = expand_tilde(p);
+        cmd.current_dir(Path::new(&expanded));
+    }
+}
+
+fn command_for_entry(
+    entry: &DesktopEntry,
+    terminal_cmd: &str,
+    extra_args: &[String],
+) -> Result<Command> {
     let type_ = entry.type_();
 
     match type_ {
@@ -505,36 +564,34 @@ fn run_entry(entry: &DesktopEntry, terminal_cmd: &str, extra_args: &[String]) ->
                 bail!("TryExec not found: {}", entry.try_exec().unwrap_or(""));
             }
 
-            let file_args = extra_args.to_vec();
-            let url_args: Vec<String> = Vec::new();
+            let exec = entry.exec().context("entry has no Exec key")?;
+            let (file_args, url_args) = split_extra_args_for_exec(exec, extra_args);
             let (program, args) = build_command(entry, &file_args, &url_args)?;
 
             let terminal_tokens = tokenize_exec(terminal_cmd);
             let use_terminal = entry.terminal() && !terminal_tokens.is_empty();
 
-            if use_terminal {
-                let mut argv: Vec<String> = Vec::new();
-                argv.extend(terminal_tokens.iter().cloned());
-                argv.push(program.clone());
-                argv.extend(args.clone());
-
-                Err(Command::new(&argv[0]).args(&argv[1..]).exec().into())
+            let mut cmd = if use_terminal {
+                let mut cmd = Command::new(&terminal_tokens[0]);
+                cmd.args(&terminal_tokens[1..]);
+                cmd.arg(program);
+                cmd.args(args);
+                cmd
             } else {
                 let mut cmd = Command::new(&program);
-                cmd.args(&args);
+                cmd.args(args);
+                cmd
+            };
 
-                if let Some(p) = entry.path_() {
-                    let expanded = expand_tilde(p);
-                    cmd.current_dir(Path::new(&expanded));
-                }
-
-                Err(cmd.exec().into())
-            }
+            apply_entry_current_dir(&mut cmd, entry);
+            Ok(cmd)
         }
 
         "Link" => {
             let url = entry.url().context("Link entry has no URL key")?;
-            Err(Command::new("xdg-open").arg(url).exec().into())
+            let mut cmd = Command::new("xdg-open");
+            cmd.arg(url);
+            Ok(cmd)
         }
 
         "Directory" => {
@@ -545,6 +602,18 @@ fn run_entry(entry: &DesktopEntry, terminal_cmd: &str, extra_args: &[String]) ->
             bail!("unknown Type: {}", type_)
         }
     }
+}
+
+fn run_entry(entry: &DesktopEntry, terminal_cmd: &str, extra_args: &[String]) -> Result<()> {
+    let mut cmd = command_for_entry(entry, terminal_cmd, extra_args)?;
+    Err(cmd.exec().into())
+}
+
+fn spawn_entry(entry: &DesktopEntry, terminal_cmd: &str, extra_args: &[String]) -> Result<()> {
+    let mut cmd = command_for_entry(entry, terminal_cmd, extra_args)?;
+    cmd.spawn()
+        .with_context(|| format!("failed to spawn {}", entry.name()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +696,22 @@ fn xdg_data_home() -> PathBuf {
         })
 }
 
+fn xdg_config_home() -> PathBuf {
+    env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            home_dir()
+                .map(|h| PathBuf::from(h).join(".config"))
+                .unwrap_or_default()
+        })
+}
+
+fn desktop_list_matches(list: &str, desktops: &[&str]) -> bool {
+    list.split(';')
+        .filter(|s| !s.is_empty())
+        .any(|candidate| desktops.contains(&candidate))
+}
+
 // Minimal XDG helpers
 
 fn xdg_data_dirs() -> Vec<PathBuf> {
@@ -638,8 +723,7 @@ fn xdg_data_dirs() -> Vec<PathBuf> {
 }
 
 fn xdg_config_dirs() -> Vec<PathBuf> {
-    let raw =
-        env::var("XDG_CONFIG_DIRS").unwrap_or_else(|_| "/etc/xdg".into());
+    let raw = env::var("XDG_CONFIG_DIRS").unwrap_or_else(|_| "/etc/xdg".into());
     raw.split(':')
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -674,6 +758,126 @@ fn find_binary(cmd: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_entry(exec: &str) -> DesktopEntry {
+        let mut raw = BTreeMap::new();
+        raw.insert("Type".into(), "Application".into());
+        raw.insert("Name".into(), "Test App".into());
+        raw.insert("Exec".into(), exec.into());
+
+        DesktopEntry {
+            path: PathBuf::from("/tmp/test.desktop"),
+            raw,
+            id: "test".into(),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("vesper-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn tokenizes_quotes_and_escapes() {
+        let tokens = tokenize_exec(
+            r#"prog "arg with spaces" arg\ with\ spaces "quote \"inside\"" back\\slash"#,
+        );
+        assert_eq!(
+            tokens,
+            vec![
+                "prog",
+                "arg with spaces",
+                "arg with spaces",
+                "quote \"inside\"",
+                "back\\slash",
+            ]
+        );
+    }
+
+    #[test]
+    fn url_field_codes_receive_extra_args_as_urls() {
+        let entry = test_entry("browser %u");
+        let extra = vec!["https://example.com".to_string()];
+        let (file_args, url_args) = split_extra_args_for_exec(entry.exec().unwrap(), &extra);
+
+        assert!(file_args.is_empty());
+        assert_eq!(url_args, extra);
+
+        let (program, args) = build_command(&entry, &file_args, &url_args).unwrap();
+        assert_eq!(program, "browser");
+        assert_eq!(args, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn desktop_ids_include_relative_subdirs_without_extension() {
+        assert_eq!(
+            desktop_entry_id(
+                Path::new("/base/applications/foo/bar.desktop"),
+                Some(Path::new("/base/applications")),
+            ),
+            "foo-bar"
+        );
+        assert_eq!(
+            desktop_entry_id(
+                Path::new("/base/applications/bar.desktop"),
+                Some(Path::new("/base/applications")),
+            ),
+            "bar"
+        );
+        assert_eq!(
+            desktop_entry_id(Path::new("./fixtures/applications/test.desktop"), None),
+            "test"
+        );
+    }
+
+    #[test]
+    fn visibility_respects_current_desktop_lists() {
+        let mut entry = test_entry("app");
+        entry.raw.insert("OnlyShowIn".into(), "niri;sway;".into());
+        assert!(entry.visible_for(Some("niri")));
+        assert!(entry.visible_for(Some("GNOME:niri")));
+        assert!(!entry.visible_for(Some("GNOME")));
+        assert!(!entry.visible_for(None));
+
+        entry.raw.remove("OnlyShowIn");
+        entry.raw.insert("NotShowIn".into(), "GNOME;".into());
+        assert!(!entry.visible_for(Some("GNOME:niri")));
+        assert!(entry.visible_for(Some("niri")));
+    }
+
+    #[test]
+    fn autostart_user_hidden_override_suppresses_system_entry() {
+        let root = temp_dir("autostart-override");
+        let system = root.join("system/autostart");
+        let user = root.join("user/autostart");
+        fs::create_dir_all(&system).unwrap();
+        fs::create_dir_all(&user).unwrap();
+
+        fs::write(
+            system.join("thing.desktop"),
+            "[Desktop Entry]\nType=Application\nName=System Thing\nExec=thing\n",
+        )
+        .unwrap();
+        fs::write(
+            user.join("thing.desktop"),
+            "[Desktop Entry]\nType=Application\nName=User Override\nExec=thing\nHidden=true\n",
+        )
+        .unwrap();
+
+        let entries = collect_autostart_entries(&[system, user], "niri");
+        assert!(entries.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -690,9 +894,10 @@ fn main() -> Result<()> {
             icons,
         } => {
             let entries = discover_all();
+            let current_desktop = current_desktop();
             let mut filtered: Vec<&DesktopEntry> = entries
                 .iter()
-                .filter(|e| !e.hidden())
+                .filter(|e| e.visible_for(current_desktop.as_deref()))
                 .filter(|e| all || !e.no_display())
                 .filter(|e| e.type_() == "Application" || e.type_() == "Link")
                 .collect();
@@ -762,7 +967,7 @@ fn main() -> Result<()> {
                 }
                 for e in &entries {
                     eprintln!("Running: {} ({})", e.name(), e.path.display());
-                    if let Err(err) = run_entry(e, &terminal, &[]) {
+                    if let Err(err) = spawn_entry(e, &terminal, &[]) {
                         eprintln!("  error: {}", err);
                     }
                 }

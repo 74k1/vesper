@@ -25,9 +25,9 @@
 
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "vesper";
-          version = "0.1.0";
+          version = "0.1.1";
           src = ./.;
-          cargoHash = "sha256-9QCvoikM4VOQINHqFv0F5HyOy+TL2692abYDv428T8E=";
+          cargoHash = "sha256-pETCDrmnC3Z/lLKrHjzTb8XtwR4YN/5YiRT8o8nkd8o=";
           # buildInputs = with pkgs; [ ];
           meta.mainProgram = "vesper";
         };
