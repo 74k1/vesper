@@ -28,9 +28,9 @@ vesper run firefox.desktop
 # Run by path
 vesper run /usr/share/applications/firefox.desktop
 
-# Run with file or URL arguments
-vesper run gvim --args file1.txt file2.txt
-vesper run firefox --args https://example.com
+# Run with file or URL arguments (everything after -- is forwarded)
+vesper run gvim -- file1.txt file2.txt
+vesper run firefox -- https://example.com
 
 # Run with custom terminal
 vesper run htop --terminal "foot -e"

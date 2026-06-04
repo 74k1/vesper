@@ -44,8 +44,8 @@ enum Command_ {
         /// Terminal command (e.g. "foot -e")
         #[arg(long, default_value = "x-terminal-emulator -e")]
         terminal: String,
-        /// Extra file/URL arguments passed to the Exec command
-        #[arg(long, num_args = 1..)]
+        /// Extra file/URL arguments passed to the Exec command (after --)
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Inspect a parsed desktop entry
