@@ -7,11 +7,22 @@
   };
 
   outputs =
-    { nixpkgs, flake-utils, ... }:
+    { self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        inherit (pkgs) lib;
+        cargoToml = lib.importTOML ./Cargo.toml;
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./src
+            ./fixtures
+          ];
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -24,12 +35,32 @@
         };
 
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "vesper";
-          version = "0.1.1";
-          src = ./.;
-          cargoHash = "sha256-pETCDrmnC3Z/lLKrHjzTb8XtwR4YN/5YiRT8o8nkd8o=";
-          # buildInputs = with pkgs; [ ];
+          pname = cargoToml.package.name;
+          inherit (cargoToml.package) version;
+          inherit src;
+          cargoLock.lockFile = ./Cargo.lock;
           meta.mainProgram = "vesper";
+        };
+
+        # `nix flake check` runs the tests (via the package build), fmt and clippy.
+        checks = {
+          package = self.packages.${system}.default;
+          lint = pkgs.rustPlatform.buildRustPackage {
+            pname = "${cargoToml.package.name}-lint";
+            inherit (cargoToml.package) version;
+            inherit src;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = with pkgs; [
+              rustfmt
+              clippy
+            ];
+            buildPhase = ''
+              cargo fmt -- --check
+              cargo clippy --all-targets -- -D warnings
+            '';
+            doCheck = false;
+            installPhase = "touch $out";
+          };
         };
       }
     );
