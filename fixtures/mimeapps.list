@@ -1,0 +1,5 @@
+[Default Applications]
+image/svg+xml=test-browser.desktop
+application/x-vesper-magic=test-editor.desktop
+text/html=test-browser.desktop
+text/plain=test-editor.desktop
