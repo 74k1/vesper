@@ -2,4 +2,3 @@
 50:application/x-desktop:*.desktop
 50:image/svg+xml:*.svg
 50:text/plain:*.txt
-50:application/x-vesper-magic:*.vesper

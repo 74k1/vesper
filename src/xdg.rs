@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// XDG base directories, environment, and small string helpers
+// XDG base directories and environment lookups
 // ---------------------------------------------------------------------------
 
 use std::env;
@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 /// An environment value as a path, if set, non-empty and absolute. The XDG
 /// basedir spec says relative paths must be ignored.
-pub fn absolute_path(value: Option<OsString>) -> Option<PathBuf> {
+fn absolute_path(value: Option<OsString>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|p| p.is_absolute())
 }
 
 /// A colon-separated path list; unset or empty falls back to `default`.
-pub fn path_list(value: Option<OsString>, default: &str) -> Vec<PathBuf> {
+fn path_list(value: Option<OsString>, default: &str) -> Vec<PathBuf> {
     let value = value
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.into());
@@ -24,8 +24,35 @@ pub fn path_list(value: Option<OsString>, default: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn home_dir() -> Option<PathBuf> {
+fn home_dir() -> Option<PathBuf> {
     absolute_path(env::var_os("HOME"))
+}
+
+fn home_or(var: &str, fallback: &str) -> Option<PathBuf> {
+    absolute_path(env::var_os(var)).or_else(|| home_dir().map(|home| home.join(fallback)))
+}
+
+pub fn config_home() -> Option<PathBuf> {
+    home_or("XDG_CONFIG_HOME", ".config")
+}
+
+/// `$XDG_DATA_HOME` followed by `$XDG_DATA_DIRS`, highest priority first.
+pub fn data_dirs() -> Vec<PathBuf> {
+    home_or("XDG_DATA_HOME", ".local/share")
+        .into_iter()
+        .chain(path_list(
+            env::var_os("XDG_DATA_DIRS"),
+            "/usr/local/share:/usr/share",
+        ))
+        .collect()
+}
+
+/// `$XDG_CONFIG_HOME` followed by `$XDG_CONFIG_DIRS`, highest priority first.
+pub fn config_dirs() -> Vec<PathBuf> {
+    config_home()
+        .into_iter()
+        .chain(path_list(env::var_os("XDG_CONFIG_DIRS"), "/etc/xdg"))
+        .collect()
 }
 
 pub fn current_desktop() -> Option<String> {
@@ -34,36 +61,11 @@ pub fn current_desktop() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Each desktop name in `$XDG_CURRENT_DESKTOP`, highest priority first.
-pub fn desktop_names() -> Vec<String> {
-    current_desktop()
-        .map(|d| {
-            d.split(':')
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+/// Each desktop name in an `$XDG_CURRENT_DESKTOP` value, highest priority first.
+pub fn desktop_names(value: &str) -> impl Iterator<Item = &str> {
+    value.split(':').filter(|s| !s.is_empty())
 }
 
-pub fn xdg_data_home() -> Option<PathBuf> {
-    absolute_path(env::var_os("XDG_DATA_HOME"))
-        .or_else(|| home_dir().map(|h| h.join(".local/share")))
-}
-
-pub fn xdg_config_home() -> Option<PathBuf> {
-    absolute_path(env::var_os("XDG_CONFIG_HOME")).or_else(|| home_dir().map(|h| h.join(".config")))
-}
-
-pub fn xdg_data_dirs() -> Vec<PathBuf> {
-    path_list(env::var_os("XDG_DATA_DIRS"), "/usr/local/share:/usr/share")
-}
-
-pub fn xdg_config_dirs() -> Vec<PathBuf> {
-    path_list(env::var_os("XDG_CONFIG_DIRS"), "/etc/xdg")
-}
-
-/// Resolve a `~/` prefix.
 pub fn expand_tilde(s: &str) -> PathBuf {
     if let (Some(rest), Some(home)) = (s.strip_prefix("~/"), home_dir()) {
         return home.join(rest);
@@ -71,11 +73,12 @@ pub fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-pub fn is_executable(p: &Path) -> bool {
+fn is_executable(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Find an executable in PATH, resolving `~`.
+/// Find an executable: in PATH for a bare name, otherwise at the given
+/// path (with `~/` resolved).
 pub fn find_binary(cmd: &str) -> Option<PathBuf> {
     if cmd.is_empty() {
         return None;
@@ -90,67 +93,6 @@ pub fn find_binary(cmd: &str) -> Option<PathBuf> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(cmd))
         .find(|p| is_executable(p))
-}
-
-/// Replace characters that would break the tab-separated output format.
-pub fn tsv_field(s: &str) -> String {
-    s.replace(['\t', '\n', '\r'], " ")
-}
-
-/// Decode `%XX` escapes in a URI component.
-pub fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                out.push(hi * 16 + lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// `$BROWSER` as a list of commands, in order of preference.
-pub fn browser_commands() -> Vec<String> {
-    env::var("BROWSER")
-        .ok()
-        .map(|v| {
-            v.split(':')
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `$VESPER_FALLBACKS` as a list of commands, in order of preference.
-pub fn fallback_commands() -> Vec<String> {
-    env::var("VESPER_FALLBACKS")
-        .ok()
-        .map(|v| {
-            v.split(':')
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -173,19 +115,5 @@ mod tests {
             path_list(Some("rel:/c::".into()), "/a"),
             vec![PathBuf::from("/c")]
         );
-    }
-
-    #[test]
-    fn percent_decoding_handles_escapes_and_literals() {
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("100%25"), "100%");
-        assert_eq!(percent_decode("no-escapes"), "no-escapes");
-        assert_eq!(percent_decode("bad%zz"), "bad%zz");
-        assert_eq!(percent_decode("%2Ftmp%2Ffile"), "/tmp/file");
-    }
-
-    #[test]
-    fn tsv_fields_lose_separators() {
-        assert_eq!(tsv_field("a\tb\nc\rd"), "a b c d");
     }
 }

@@ -1,10 +1,27 @@
 // ---------------------------------------------------------------------------
-// Test-only filesystem helpers
+// Test-only helpers
 // ---------------------------------------------------------------------------
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::desktop::DesktopEntry;
+
+/// An Application entry with the ID `test` and the given Exec value.
+pub fn test_entry(exec: &str) -> DesktopEntry {
+    let mut raw = BTreeMap::new();
+    raw.insert("Type".into(), "Application".into());
+    raw.insert("Name".into(), "Test App".into());
+    raw.insert("Exec".into(), exec.into());
+
+    DesktopEntry {
+        path: PathBuf::from("/tmp/test.desktop"),
+        raw,
+        id: "test".into(),
+    }
+}
 
 /// Temporary directory removed on drop, even if the test panics.
 pub struct TempDir(pub PathBuf);

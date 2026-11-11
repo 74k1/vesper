@@ -4,30 +4,13 @@
 
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use eyre::{bail, ContextCompat, Result};
 
 use crate::desktop::DesktopEntry;
-use crate::exec::{build_command, has_field_code, route_extra_args, tokenize_exec};
+use crate::exec::{build_command, route_args, tokenize_exec};
 use crate::xdg;
-
-/// What the user asked to open.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    File(PathBuf),
-    Url(String),
-}
-
-impl Target {
-    pub fn as_argument(&self) -> String {
-        match self {
-            Target::File(path) => path.to_string_lossy().into_owned(),
-            Target::Url(url) => url.clone(),
-        }
-    }
-}
 
 /// How the child process relates to the current one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,11 +23,9 @@ pub enum LaunchMode {
     Spawn,
 }
 
-/// Resolve the terminal command: `--terminal`, then `$TERMINAL -e`, then
-/// `xdg-terminal-exec`, then `x-terminal-emulator -e`.
-pub fn resolve_terminal(flag: Option<String>) -> String {
+fn resolve_terminal(flag: Option<&str>) -> String {
     if let Some(t) = flag {
-        return t;
+        return t.to_string();
     }
     if let Some(t) = std::env::var("TERMINAL")
         .ok()
@@ -58,28 +39,38 @@ pub fn resolve_terminal(flag: Option<String>) -> String {
     "x-terminal-emulator -e".into()
 }
 
-/// Build the command for an Application entry.
+/// Build the command for an Application entry, routing `args` through its
+/// field codes. `terminal` is the `--terminal` override used when the entry
+/// sets `Terminal=true`. `are_urls` says the arguments are known to be URLs;
+/// untyped arguments (as from `vesper run`) pass `false`.
 pub fn command_for_entry(
     entry: &DesktopEntry,
-    terminal_cmd: &str,
-    file_args: &[String],
-    url_args: &[String],
+    terminal: Option<&str>,
+    args: &[String],
+    are_urls: bool,
 ) -> Result<Command> {
-    match entry.type_() {
-        "Application" => {}
-        "Link" => bail!("Link entries dispatch through the MIME resolver"),
-        "Directory" => bail!("Directory entries are not runnable"),
-        other => bail!("unknown Type: {}", other),
+    if entry.type_() != "Application" {
+        bail!("{} entries are not runnable", entry.type_());
     }
 
     if !entry.try_exec_ok() {
         bail!("TryExec not found: {}", entry.try_exec().unwrap_or(""));
     }
 
-    let (program, args) = build_command(entry, file_args, url_args)?;
+    let exec = entry.exec().context("entry has no Exec key")?;
+    let routed = route_args(exec, args, are_urls);
+    if !routed.dropped.is_empty() {
+        eprintln!(
+            "vesper: warning: {} does not take these arguments, ignoring: {}",
+            entry.id,
+            routed.dropped.join(" ")
+        );
+    }
+
+    let (program, args) = build_command(entry, &routed.files, &routed.urls)?;
 
     let mut cmd = if entry.terminal() {
-        let terminal_tokens = tokenize_exec(terminal_cmd)?;
+        let terminal_tokens = tokenize_exec(&resolve_terminal(terminal))?;
         let (terminal, terminal_args) = terminal_tokens
             .split_first()
             .context("Terminal=true but the terminal command is empty")?;
@@ -103,60 +94,8 @@ pub fn command_for_entry(
     Ok(cmd)
 }
 
-/// Route a single open target to the field codes the entry declares.
-pub fn route_target(entry: &DesktopEntry, target: Option<&Target>) -> (Vec<String>, Vec<String>) {
-    let Some(target) = target else {
-        return (Vec::new(), Vec::new());
-    };
-
-    let exec = entry.exec().unwrap_or("");
-    let wants_files = has_field_code(exec, 'f') || has_field_code(exec, 'F');
-    let wants_urls = has_field_code(exec, 'u') || has_field_code(exec, 'U');
-    let argument = target.as_argument();
-
-    match target {
-        Target::File(_) => {
-            if wants_files {
-                (vec![argument], Vec::new())
-            } else if wants_urls {
-                (Vec::new(), vec![argument])
-            } else {
-                eprintln!(
-                    "vesper: warning: {} has no file field code, ignoring {}",
-                    entry.id, argument
-                );
-                (Vec::new(), Vec::new())
-            }
-        }
-        Target::Url(_) => {
-            if wants_urls {
-                (Vec::new(), vec![argument])
-            } else if wants_files {
-                (vec![argument], Vec::new())
-            } else {
-                eprintln!(
-                    "vesper: warning: {} has no URL field code, ignoring {}",
-                    entry.id, argument
-                );
-                (Vec::new(), Vec::new())
-            }
-        }
-    }
-}
-
 extern "C" {
     fn setsid() -> i32;
-}
-
-/// Start the child in its own session so it survives the launching terminal.
-fn new_session(cmd: &mut Command) {
-    // SAFETY: setsid is async-signal-safe and touches no parent state.
-    unsafe {
-        cmd.pre_exec(|| {
-            setsid();
-            Ok(())
-        });
-    }
 }
 
 fn launch_error(cmd: &Command, err: io::Error) -> eyre::Report {
@@ -167,134 +106,50 @@ fn launch_error(cmd: &Command, err: io::Error) -> eyre::Report {
     eyre::Report::new(err).wrap_err(msg)
 }
 
-fn execute(mut cmd: Command, mode: LaunchMode) -> Result<()> {
-    match mode {
-        LaunchMode::Replace => {
-            let err = cmd.exec();
-            Err(launch_error(&cmd, err))
-        }
-        LaunchMode::Detach => {
-            new_session(&mut cmd);
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            cmd.spawn().map(|_| ()).map_err(|e| launch_error(&cmd, e))
-        }
-        LaunchMode::Spawn => {
-            new_session(&mut cmd);
-            cmd.spawn().map(|_| ()).map_err(|e| launch_error(&cmd, e))
-        }
+/// Run `cmd`. `Replace` only returns on failure.
+pub fn execute(mut cmd: Command, mode: LaunchMode) -> Result<()> {
+    if mode == LaunchMode::Replace {
+        let err = cmd.exec();
+        return Err(launch_error(&cmd, err));
     }
+
+    // A new session lets the child survive the launching terminal.
+    // SAFETY: setsid is async-signal-safe and touches no parent state.
+    unsafe {
+        cmd.pre_exec(|| {
+            setsid();
+            Ok(())
+        });
+    }
+    if mode == LaunchMode::Detach {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
+    cmd.spawn().map(|_| ()).map_err(|e| launch_error(&cmd, e))
 }
 
-/// Launch an Application entry with an optional open target.
-pub fn launch_target(
+/// Launch an Application entry; see `command_for_entry` for the arguments.
+pub fn launch(
     entry: &DesktopEntry,
-    terminal_cmd: &str,
-    target: Option<&Target>,
+    terminal: Option<&str>,
+    args: &[String],
+    are_urls: bool,
     mode: LaunchMode,
 ) -> Result<()> {
-    let (file_args, url_args) = route_target(entry, target);
-    let cmd = command_for_entry(entry, terminal_cmd, &file_args, &url_args)?;
-    execute(cmd, mode)
-}
-
-/// `vesper run`: route `--` arguments through the entry's field codes.
-pub fn run_entry(
-    entry: &DesktopEntry,
-    terminal_cmd: &str,
-    extra_args: &[String],
-    detach: bool,
-) -> Result<()> {
-    if entry.type_() == "Link" {
-        let url = entry.url().context("Link entry has no URL key")?;
-        let resolver = crate::mime::Resolver::load();
-        let mode = if detach {
-            LaunchMode::Detach
-        } else {
-            LaunchMode::Replace
-        };
-        return crate::open::open_target(url, Some(terminal_cmd), mode, &resolver)
-            .map_err(|err| eyre::eyre!("{}", err));
-    }
-
-    let exec = entry.exec().context("entry has no Exec key")?;
-    let (file_args, url_args, dropped) = route_extra_args(exec, extra_args);
-    if !dropped.is_empty() {
-        eprintln!(
-            "vesper: warning: {} does not take these arguments, ignoring: {}",
-            entry.id,
-            dropped.join(" ")
-        );
-    }
-
-    let cmd = command_for_entry(entry, terminal_cmd, &file_args, &url_args)?;
-    execute(
-        cmd,
-        if detach {
-            LaunchMode::Detach
-        } else {
-            LaunchMode::Replace
-        },
-    )
-}
-
-/// `autostart --run`: spawn without replacing the current process.
-pub fn spawn_entry(entry: &DesktopEntry, terminal_cmd: &str) -> Result<()> {
-    let cmd = command_for_entry(entry, terminal_cmd, &[], &[])?;
-    execute(cmd, LaunchMode::Spawn)
+    execute(command_for_entry(entry, terminal, args, are_urls)?, mode)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
-    fn test_entry(exec: &str) -> DesktopEntry {
-        let mut raw = BTreeMap::new();
-        raw.insert("Type".into(), "Application".into());
-        raw.insert("Name".into(), "Test App".into());
-        raw.insert("Exec".into(), exec.into());
-        DesktopEntry::new(PathBuf::from("/tmp/test.desktop"), raw, "test".into())
-    }
-
-    #[test]
-    fn routes_files_and_urls_to_matching_field_codes() {
-        let entry = test_entry("app %f");
-        let file = Target::File(PathBuf::from("/tmp/a.txt"));
-        let url = Target::Url("https://example.com".into());
-
-        assert_eq!(
-            route_target(&entry, Some(&file)),
-            (vec!["/tmp/a.txt".to_string()], Vec::new())
-        );
-        assert_eq!(
-            route_target(&entry, Some(&url)),
-            (vec!["https://example.com".to_string()], Vec::new())
-        );
-    }
-
-    #[test]
-    fn routes_url_targets_to_url_field_codes() {
-        let entry = test_entry("app %U");
-        let file = Target::File(PathBuf::from("/tmp/a.txt"));
-        let url = Target::Url("https://example.com".into());
-
-        assert_eq!(
-            route_target(&entry, Some(&file)),
-            (Vec::new(), vec!["/tmp/a.txt".to_string()])
-        );
-        assert_eq!(
-            route_target(&entry, Some(&url)),
-            (Vec::new(), vec!["https://example.com".to_string()])
-        );
-    }
+    use crate::test_support::test_entry;
 
     #[test]
     fn wraps_terminal_commands() {
         let mut entry = test_entry("htop");
         entry.raw.insert("Terminal".into(), "true".into());
-        let cmd = command_for_entry(&entry, "foot -e", &[], &[]).unwrap();
+        let cmd = command_for_entry(&entry, Some("foot -e"), &[], false).unwrap();
 
         assert_eq!(cmd.get_program(), "foot");
         assert_eq!(

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// MIME detection, mimeapps resolution, writer, and settings helpers
+// MIME detection, mimeapps resolution, and the mimeapps.list writer
 // ---------------------------------------------------------------------------
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,39 +9,33 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::desktop::{self, DesktopEntry};
+use crate::failure::Failure;
 use crate::xdg;
 
 const OCTET_STREAM: &str = "application/octet-stream";
 const TEXT_PLAIN: &str = "text/plain";
 const X_DESKTOP: &str = "application/x-desktop";
+const DEFAULT_APPLICATIONS: &str = "Default Applications";
 
-/// MIME types written by `xdg-settings set default-web-browser`.
-pub const WEB_BROWSER_MIMES: [&str; 5] = [
-    "text/html",
-    "x-scheme-handler/http",
-    "x-scheme-handler/https",
-    "x-scheme-handler/about",
-    "x-scheme-handler/unknown",
-];
+/// Magic matches at or above this priority beat a glob match, as
+/// shared-mime-info specifies.
+const MAGIC_WINS: u32 = 80;
 
 // ---------------------------------------------------------------------------
 // Glob matching
 // ---------------------------------------------------------------------------
 
 /// Match a shared-mime-info glob against a file name.
-pub fn glob_match(pattern: &str, name: &str, case_sensitive: bool) -> bool {
-    let pattern: Vec<char> = if case_sensitive {
-        pattern.chars().collect()
-    } else {
-        pattern.chars().flat_map(|c| c.to_lowercase()).collect()
-    };
-    let name: Vec<char> = if case_sensitive {
-        name.chars().collect()
-    } else {
-        name.chars().flat_map(|c| c.to_lowercase()).collect()
+fn glob_match(pattern: &str, name: &str, case_sensitive: bool) -> bool {
+    let chars = |text: &str| -> Vec<char> {
+        if case_sensitive {
+            text.chars().collect()
+        } else {
+            text.chars().flat_map(char::to_lowercase).collect()
+        }
     };
 
-    match_glob(&pattern, 0, &name, 0)
+    match_glob(&chars(pattern), 0, &chars(name), 0)
 }
 
 fn match_glob(pattern: &[char], mut pi: usize, name: &[char], mut ni: usize) -> bool {
@@ -152,7 +146,7 @@ struct GlobRule {
 
 #[derive(Debug, Clone)]
 struct MagicRule {
-    indent: u32,
+    indent: usize,
     offset: usize,
     value: Vec<u8>,
     mask: Option<Vec<u8>>,
@@ -175,10 +169,9 @@ pub struct MimeDatabase {
 }
 
 impl MimeDatabase {
-    /// Load the shared-mime-info database from the XDG data directories.
     pub fn load() -> Self {
         let mut db = MimeDatabase::default();
-        for dir in mime_dirs() {
+        for dir in xdg::data_dirs() {
             db.load_mime_dir(&dir.join("mime"));
         }
         db
@@ -186,7 +179,7 @@ impl MimeDatabase {
 
     /// Load `aliases`, `subclasses`, `globs2` (or `globs`) and `magic` from
     /// one MIME data directory.
-    pub fn load_mime_dir(&mut self, dir: &Path) {
+    fn load_mime_dir(&mut self, dir: &Path) {
         if let Ok(content) = fs::read_to_string(dir.join("aliases")) {
             for line in content.lines() {
                 let mut parts = line.split_whitespace();
@@ -223,8 +216,8 @@ impl MimeDatabase {
         }
     }
 
-    /// Follow aliases until a canonical type is found.
-    pub fn unalias(&self, mime: &str) -> String {
+    /// The canonical name of a type. The loop bound guards alias cycles.
+    fn unalias(&self, mime: &str) -> String {
         let mut current = mime.to_string();
         for _ in 0..8 {
             match self.aliases.get(&current) {
@@ -236,7 +229,7 @@ impl MimeDatabase {
     }
 
     /// All parent types of `mime`, transitively, excluding `mime` itself.
-    pub fn ancestors(&self, mime: &str) -> Vec<String> {
+    fn ancestors(&self, mime: &str) -> Vec<String> {
         let canonical = self.unalias(mime);
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
@@ -258,7 +251,7 @@ impl MimeDatabase {
         out
     }
 
-    pub fn mime_type_subclass(&self, mime: &str, base: &str) -> bool {
+    fn mime_type_subclass(&self, mime: &str, base: &str) -> bool {
         let mime = self.unalias(mime);
         let base = self.unalias(base);
         mime == base || self.ancestors(&mime).contains(&base)
@@ -273,19 +266,11 @@ impl MimeDatabase {
             .filter(|rule| glob_match(&rule.pattern, file_name, rule.case_sensitive))
             .collect();
 
-        let Some(max_weight) = matching.iter().map(|rule| rule.weight).max() else {
+        let rank = |rule: &GlobRule| (rule.weight, rule.pattern.chars().count());
+        let Some(best) = matching.iter().map(|rule| rank(rule)).max() else {
             return Vec::new();
         };
-        matching.retain(|rule| rule.weight == max_weight);
-
-        let Some(max_length) = matching
-            .iter()
-            .map(|rule| rule.pattern.chars().count())
-            .max()
-        else {
-            return Vec::new();
-        };
-        matching.retain(|rule| rule.pattern.chars().count() == max_length);
+        matching.retain(|rule| rank(rule) == best);
 
         let mut out: Vec<String> = Vec::new();
         for rule in matching {
@@ -344,28 +329,7 @@ impl MimeDatabase {
         let data = read_prefix(path, limit);
         let sniffed = self.sniff(&data);
 
-        if glob_types.is_empty() {
-            return match sniffed {
-                Some((mut mime, _)) => {
-                    if mime == OCTET_STREAM && looks_like_text(&data) {
-                        mime = TEXT_PLAIN.into();
-                    }
-                    if mime == X_DESKTOP && !file_name.ends_with(".desktop") {
-                        mime = TEXT_PLAIN.into();
-                    }
-                    mime
-                }
-                None => {
-                    if looks_like_text(&data) {
-                        TEXT_PLAIN.into()
-                    } else {
-                        OCTET_STREAM.into()
-                    }
-                }
-            };
-        }
-
-        let (mut mime, priority) = sniffed.unwrap_or((OCTET_STREAM.to_string(), 80));
+        let (mut mime, priority) = sniffed.unwrap_or((OCTET_STREAM.to_string(), MAGIC_WINS));
 
         if mime == OCTET_STREAM && looks_like_text(&data) {
             mime = TEXT_PLAIN.into();
@@ -376,8 +340,12 @@ impl MimeDatabase {
             mime = TEXT_PLAIN.into();
         }
 
+        if glob_types.is_empty() {
+            return mime;
+        }
+
         if mime != OCTET_STREAM {
-            if priority >= 80 {
+            if priority >= MAGIC_WINS {
                 return mime;
             }
             if glob_types
@@ -409,15 +377,6 @@ fn looks_like_text(data: &[u8]) -> bool {
         .iter()
         .take(128)
         .any(|c| c.is_ascii_control() && !c.is_ascii_whitespace())
-}
-
-pub fn mime_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = xdg::xdg_data_home() {
-        dirs.push(home);
-    }
-    dirs.extend(xdg::xdg_data_dirs());
-    dirs
 }
 
 // ---------------------------------------------------------------------------
@@ -537,35 +496,21 @@ fn parse_magic(bytes: &[u8]) -> Vec<MagicEntry> {
     entries
 }
 
+/// Parse the decimal number that ends at the next `stop` byte. Returns the
+/// number (0 if absent) and the index after `stop`.
+fn number_until(bytes: &[u8], start: usize, stop: u8) -> Option<(usize, usize)> {
+    let end = start + bytes[start..].iter().position(|&b| b == stop)?;
+    let number = std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Some((number, end + 1))
+}
+
 fn parse_magic_rule(bytes: &[u8], start: usize) -> Option<(MagicRule, usize)> {
-    let mut i = start;
+    let (indent, i) = number_until(bytes, start, b'>')?;
+    let (offset, mut i) = number_until(bytes, i, b'=')?;
 
-    let indent_start = i;
-    while i < bytes.len() && bytes[i] != b'>' {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return None;
-    }
-    let indent = std::str::from_utf8(&bytes[indent_start..i])
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-
-    i += 1; // '>'
-    let offset_start = i;
-    while i < bytes.len() && bytes[i] != b'=' {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return None;
-    }
-    let offset = std::str::from_utf8(&bytes[offset_start..i])
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    i += 1; // '='
     if i + 2 > bytes.len() {
         return None;
     }
@@ -657,7 +602,7 @@ fn magic_rule_matches(rule: &MagicRule, data: &[u8]) -> bool {
 }
 
 fn magic_entry_matches(entry: &MagicEntry, data: &[u8]) -> bool {
-    let mut level = 0u32;
+    let mut level = 0usize;
     let mut iter = entry.rules.iter().peekable();
 
     while let Some(rule) = iter.next() {
@@ -686,21 +631,16 @@ struct MimeAppsFile {
 fn parse_mimeapps(content: &str) -> MimeAppsFile {
     let mut file = MimeAppsFile::default();
 
-    for (group, keys) in desktop::parse_ini_groups(content, false) {
+    for (group, keys) in desktop::parse_ini_groups(content) {
         let target = match group.as_str() {
-            "Default Applications" => &mut file.defaults,
+            DEFAULT_APPLICATIONS => &mut file.defaults,
             "Added Associations" => &mut file.added,
             "Removed Associations" => &mut file.removed,
             _ => continue,
         };
 
         for (mime, value) in keys {
-            let ids: Vec<String> = value
-                .split(';')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
+            let ids: Vec<String> = desktop::split_list(&value).map(str::to_string).collect();
             if !ids.is_empty() {
                 target.entry(mime).or_default().extend(ids);
             }
@@ -710,53 +650,37 @@ fn parse_mimeapps(content: &str) -> MimeAppsFile {
     file
 }
 
-fn read_mimeapps(path: &Path) -> Option<MimeAppsFile> {
-    let content = fs::read_to_string(path).ok()?;
-    Some(parse_mimeapps(&content))
+fn section_ids<'a>(
+    section: &'a BTreeMap<String, Vec<String>>,
+    mime: &str,
+) -> impl Iterator<Item = &'a str> {
+    section.get(mime).into_iter().flatten().map(String::as_str)
 }
 
 /// mimeapps.list files in precedence order, including desktop-specific
 /// variants and the deprecated defaults.list.
-pub fn mimeapps_files() -> Vec<PathBuf> {
+fn mimeapps_files() -> Vec<PathBuf> {
+    let application_dirs = desktop::application_dirs();
+    let bases: Vec<PathBuf> = xdg::config_dirs()
+        .into_iter()
+        .chain(application_dirs.iter().cloned())
+        .collect();
+
+    let desktop = xdg::current_desktop().unwrap_or_default();
+    let mut slots: Vec<Vec<String>> = xdg::desktop_names(&desktop)
+        .map(|name| vec![format!("{name}-mimeapps.list"), "mimeapps.list".into()])
+        .collect();
+    if slots.is_empty() {
+        slots.push(vec!["mimeapps.list".into()]);
+    }
+
     let mut out = Vec::new();
-    let desktops = xdg::desktop_names();
-    let desktop_options: Vec<Option<String>> = if desktops.is_empty() {
-        vec![None]
-    } else {
-        desktops.into_iter().map(Some).collect()
-    };
-
-    for desktop in desktop_options {
-        let prefix = desktop.map(|name| format!("{name}-"));
-
-        let mut push_slot = |base: PathBuf| {
-            if let Some(prefix) = &prefix {
-                out.push(base.join(format!("{prefix}mimeapps.list")));
-            }
-            out.push(base.join("mimeapps.list"));
-        };
-
-        if let Some(home) = xdg::xdg_config_home() {
-            push_slot(home);
-        }
-        for dir in xdg::xdg_config_dirs() {
-            push_slot(dir);
-        }
-        if let Some(home) = xdg::xdg_data_home() {
-            push_slot(home.join("applications"));
-        }
-        for dir in xdg::xdg_data_dirs() {
-            push_slot(dir.join("applications"));
+    for names in &slots {
+        for base in &bases {
+            out.extend(names.iter().map(|name| base.join(name)));
         }
     }
-
-    if let Some(home) = xdg::xdg_data_home() {
-        out.push(home.join("applications/defaults.list"));
-    }
-    for dir in xdg::xdg_data_dirs() {
-        out.push(dir.join("applications/defaults.list"));
-    }
-
+    out.extend(application_dirs.iter().map(|dir| dir.join("defaults.list")));
     out
 }
 
@@ -771,7 +695,8 @@ impl Resolver {
         let db = MimeDatabase::load();
         let files = mimeapps_files()
             .into_iter()
-            .filter_map(|path| read_mimeapps(&path))
+            .filter_map(|path| fs::read_to_string(path).ok())
+            .map(|content| parse_mimeapps(&content))
             .collect();
         let entries = desktop::discover_all();
         Resolver { db, files, entries }
@@ -781,115 +706,60 @@ impl Resolver {
         self.db.detect(path)
     }
 
-    /// Resolve a MIME type to a desktop entry ID.
-    pub fn resolve(&self, mime: &str) -> Option<String> {
+    /// Resolve a MIME type to the desktop entry that handles it: for the type
+    /// itself and then each parent type, the configured association first,
+    /// then an entry claiming the type in `MimeType=`.
+    pub fn resolve(&self, mime: &str) -> Option<&DesktopEntry> {
         let canonical = self.db.unalias(mime);
         let mut order = vec![canonical.clone()];
-        if canonical != mime {
-            order.push(mime.to_string());
-        }
-
-        for candidate in &order {
-            if let Some(id) = self.lookup_exact(candidate) {
-                return Some(id);
-            }
-            if let Some(id) = self.claim(candidate) {
-                return Some(id);
+        for candidate in std::iter::once(mime.to_string()).chain(self.db.ancestors(&canonical)) {
+            if !order.contains(&candidate) {
+                order.push(candidate);
             }
         }
 
-        for parent in self.db.ancestors(&canonical) {
-            if order.contains(&parent) {
-                continue;
-            }
-            if let Some(id) = self.lookup_exact(&parent) {
-                return Some(id);
-            }
-            if let Some(id) = self.claim(&parent) {
-                return Some(id);
-            }
-        }
-
-        None
-    }
-
-    fn has_entry(&self, id: &str) -> bool {
-        let id = normalize_id(id);
-        self.entries
+        order
             .iter()
-            .any(|entry| normalize_id(&entry.id) == id)
+            .find_map(|mime| self.lookup_exact(mime).or_else(|| self.claim(mime)))
     }
 
-    fn lookup_exact(&self, mime: &str) -> Option<String> {
-        let mut removed: BTreeSet<String> = BTreeSet::new();
-        let mut added: Vec<String> = Vec::new();
-        let mut default: Option<String> = None;
+    /// The configured association: the first installed default, else the
+    /// first installed added association. A `[Removed Associations]` line
+    /// only filters files of lower priority than its own.
+    fn lookup_exact(&self, mime: &str) -> Option<&DesktopEntry> {
+        let installed = |id: &str| {
+            let id = id.strip_suffix(".desktop").unwrap_or(id);
+            self.entries.iter().find(|entry| entry.id == id)
+        };
+        let mut removed: BTreeSet<&str> = BTreeSet::new();
+        let mut added = None;
+        let mut default = None;
 
         for file in &self.files {
+            let first_allowed = |section| {
+                section_ids(section, mime)
+                    .filter(|id| !removed.contains(id))
+                    .find_map(installed)
+            };
             if default.is_none() {
-                if let Some(ids) = file.defaults.get(mime) {
-                    default = ids.iter().find(|id| !removed.contains(*id)).cloned();
-                }
+                default = first_allowed(&file.defaults);
             }
-
-            if let Some(ids) = file.added.get(mime) {
-                for id in ids {
-                    if !removed.contains(id) && !added.contains(id) {
-                        added.push(id.clone());
-                    }
-                }
+            if added.is_none() {
+                added = first_allowed(&file.added);
             }
-
-            if let Some(ids) = file.removed.get(mime) {
-                removed.extend(ids.iter().cloned());
-            }
+            removed.extend(section_ids(&file.removed, mime));
         }
 
-        default
-            .or_else(|| added.into_iter().next())
-            .filter(|id| self.has_entry(id))
-            .map(|id| with_desktop_suffix(&id))
+        default.or(added)
     }
 
-    fn claim(&self, mime: &str) -> Option<String> {
-        self.entries
-            .iter()
-            .find(|entry| {
-                entry
-                    .mime_types()
-                    .iter()
-                    .any(|claimed| claimed == mime || self.db.unalias(claimed) == mime)
-            })
-            .map(|entry| with_desktop_suffix(&entry.id))
+    fn claim(&self, mime: &str) -> Option<&DesktopEntry> {
+        self.entries.iter().find(|entry| {
+            entry
+                .mime_types()
+                .any(|claimed| claimed == mime || self.db.unalias(claimed) == mime)
+        })
     }
-
-    #[cfg(test)]
-    fn from_parts(db: MimeDatabase, files: Vec<MimeAppsFile>, entries: Vec<DesktopEntry>) -> Self {
-        Resolver { db, files, entries }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Resolver {
-            db: MimeDatabase::default(),
-            files: Vec::new(),
-            entries: Vec::new(),
-        }
-    }
-}
-
-/// The default browser, read from `text/html` then `x-scheme-handler/http`.
-pub fn web_browser(resolver: &Resolver) -> Option<String> {
-    resolver
-        .resolve("text/html")
-        .or_else(|| resolver.resolve("x-scheme-handler/http"))
-}
-
-pub fn web_browser_mimes() -> Vec<String> {
-    WEB_BROWSER_MIMES
-        .iter()
-        .map(|mime| mime.to_string())
-        .collect()
 }
 
 pub fn scheme_mime(scheme: &str) -> String {
@@ -900,70 +770,50 @@ pub fn scheme_mime(scheme: &str) -> String {
 // mimeapps.list writer
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub struct WriteError {
-    pub code: i32,
-    pub message: String,
-}
-
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.message)
-    }
-}
-
-fn write_error(path: &Path, err: &io::Error) -> WriteError {
-    WriteError {
-        code: 6,
-        message: format!("cannot write {} ({})", path.display(), err),
-    }
-}
-
 /// Set the default application for each MIME type in
 /// `$XDG_CONFIG_HOME/mimeapps.list`.
-pub fn set_default(app: &str, mimes: &[String], warn_missing: bool) -> Result<(), WriteError> {
-    let config_home = xdg::xdg_config_home().ok_or_else(|| WriteError {
-        code: 1,
-        message: "XDG_CONFIG_HOME and HOME are unset".into(),
-    })?;
-    set_default_in(&config_home, app, mimes, warn_missing)
+pub fn set_default(app: &str, mimes: &[String]) -> Result<(), Failure> {
+    let config_home = xdg::config_home()
+        .ok_or_else(|| Failure::new(Failure::USAGE, "XDG_CONFIG_HOME and HOME are unset"))?;
+    set_default_in(&config_home, app, mimes)
 }
 
 /// Set defaults in `config_home/mimeapps.list`. Split out so tests do not
 /// mutate process environment.
-pub fn set_default_in(
-    config_home: &Path,
-    app: &str,
-    mimes: &[String],
-    warn_missing: bool,
-) -> Result<(), WriteError> {
+fn set_default_in(config_home: &Path, app: &str, mimes: &[String]) -> Result<(), Failure> {
     if !app.ends_with(".desktop") {
-        return Err(WriteError {
-            code: 1,
-            message: format!("malformed argument '{}', expected *.desktop", app),
-        });
+        return Err(Failure::new(
+            Failure::USAGE,
+            format!("malformed argument '{}', expected *.desktop", app),
+        ));
     }
     if mimes.is_empty() {
-        return Err(WriteError {
-            code: 1,
-            message: "no MIME type given".into(),
-        });
+        return Err(Failure::new(Failure::USAGE, "no MIME type given"));
     }
+
+    let write_error = |path: &Path, err: &io::Error| {
+        Failure::new(
+            Failure::WRITE,
+            format!("cannot write {} ({})", path.display(), err),
+        )
+    };
 
     let target = config_home.join("mimeapps.list");
     let resolved = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
 
     let existing = match fs::read(&resolved) {
-        Ok(bytes) => String::from_utf8(bytes).map_err(|_| WriteError {
-            code: 5,
-            message: format!("{} is not valid UTF-8", resolved.display()),
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| {
+            Failure::new(
+                Failure::READ,
+                format!("{} is not valid UTF-8", resolved.display()),
+            )
         })?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => {
-            return Err(WriteError {
-                code: 5,
-                message: format!("cannot read {} ({})", resolved.display(), err),
-            })
+            return Err(Failure::new(
+                Failure::READ,
+                format!("cannot read {} ({})", resolved.display(), err),
+            ))
         }
     };
 
@@ -971,13 +821,6 @@ pub fn set_default_in(
         if let Err(err) = fs::OpenOptions::new().write(true).open(&resolved) {
             return Err(write_error(&resolved, &err));
         }
-    }
-
-    if warn_missing && desktop::find_entry(app).is_err() {
-        eprintln!(
-            "vesper: warning: {} is not a discoverable desktop entry",
-            app
-        );
     }
 
     let updated = edit_defaults(&existing, app, mimes);
@@ -1006,91 +849,73 @@ pub fn set_default_in(
     Ok(())
 }
 
+/// Rewrite `content` so each MIME type's only default is `app`. New keys go
+/// at the end of the first `[Default Applications]` group; every other line
+/// is kept as it is.
 fn edit_defaults(content: &str, app: &str, mimes: &[String]) -> String {
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let header = "[Default Applications]";
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_defaults = false;
+    let mut insert_at = None;
 
-    let mut section_start = None;
-    let mut section_end = None;
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let name = &trimmed[1..trimmed.len() - 1];
-            if name == "Default Applications" {
-                section_start = Some(index);
-            } else if section_start.is_some() {
-                section_end = Some(index);
-                break;
+    for line in content.lines() {
+        if let Some(name) = desktop::group_name(line) {
+            if in_defaults {
+                insert_at.get_or_insert(lines.len());
+            }
+            in_defaults = name == DEFAULT_APPLICATIONS;
+        } else if in_defaults {
+            let key = line.split_once('=').map(|(key, _)| key.trim());
+            if mimes.iter().any(|mime| Some(mime.as_str()) == key) {
+                continue;
             }
         }
+        lines.push(line.to_string());
     }
 
-    match section_start {
-        Some(start) => {
-            let end = section_end.unwrap_or(lines.len());
-            let mut kept: Vec<String> = lines[..=start].to_vec();
-
-            for line in &lines[start + 1..end] {
-                let trimmed = line.trim();
-                if let Some((key, _)) = trimmed.split_once('=') {
-                    if mimes.iter().any(|mime| mime == key.trim()) {
-                        continue;
-                    }
-                }
-                kept.push(line.clone());
-            }
-
-            for mime in mimes {
-                kept.push(format!("{mime}={app};"));
-            }
-
-            kept.extend(lines[end..].iter().cloned());
-            lines = kept;
-        }
-        None => {
-            if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
-                lines.push(String::new());
-            }
-            lines.push(header.to_string());
-            for mime in mimes {
-                lines.push(format!("{mime}={app};"));
-            }
-        }
+    if in_defaults {
+        insert_at.get_or_insert(lines.len());
     }
+    let insert_at = insert_at.unwrap_or_else(|| {
+        if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(format!("[{DEFAULT_APPLICATIONS}]"));
+        lines.len()
+    });
+    lines.splice(
+        insert_at..insert_at,
+        mimes.iter().map(|mime| format!("{mime}={app};")),
+    );
 
     let mut out = lines.join("\n");
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
+    out.push('\n');
     out
-}
-
-fn normalize_id(id: &str) -> &str {
-    id.strip_suffix(".desktop").unwrap_or(id)
-}
-
-fn with_desktop_suffix(id: &str) -> String {
-    if id.ends_with(".desktop") {
-        id.to_string()
-    } else {
-        format!("{id}.desktop")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{test_entry, TempDir};
 
     fn entry(id: &str, mime: Option<&str>) -> DesktopEntry {
-        let mut raw = BTreeMap::new();
-        raw.insert("Type".into(), "Application".into());
-        raw.insert("Name".into(), id.into());
-        raw.insert("Exec".into(), "prog".into());
+        let mut entry = test_entry("prog");
+        entry.id = id.into();
         if let Some(mime) = mime {
-            raw.insert("MimeType".into(), mime.into());
+            entry.raw.insert("MimeType".into(), mime.into());
         }
-        DesktopEntry::new(PathBuf::from(format!("/tmp/{id}.desktop")), raw, id.into())
+        entry
+    }
+
+    fn resolver(
+        db: MimeDatabase,
+        files: Vec<MimeAppsFile>,
+        entries: Vec<DesktopEntry>,
+    ) -> Resolver {
+        Resolver { db, files, entries }
+    }
+
+    fn resolved<'a>(resolver: &'a Resolver, mime: &str) -> Option<&'a str> {
+        resolver.resolve(mime).map(|entry| entry.id.as_str())
     }
 
     fn magic_rule_bytes(indent: &str, offset: usize, value: &[u8]) -> Vec<u8> {
@@ -1128,27 +953,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_globs2_weights_and_flags() {
-        let rules = parse_globs2("50:text/plain:*.txt\n80:image/svg+xml:*.svg:cs\n# c\n");
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].weight, 50);
-        assert_eq!(rules[1].mime, "image/svg+xml");
-        assert!(rules[1].case_sensitive);
-    }
+    fn globs_keep_biggest_weight_then_longest_pattern_and_honor_case_flag() {
+        let dir = TempDir::new("globs");
+        dir.write(
+            "mime/globs2",
+            "# comment\n50:text/x-low:*.txt\n80:text/x-short:*.txt\n\
+             80:text/x-long:*.long.txt\n50:text/x-cs:*.CS:cs\n",
+        );
+        let mut db = MimeDatabase::default();
+        db.load_mime_dir(&dir.0.join("mime"));
+        let detect = |name: &str| db.detect(&dir.write(name, "text\n"));
 
-    #[test]
-    fn glob_types_keep_biggest_weight_then_longest_pattern() {
-        let db = MimeDatabase {
-            globs: parse_globs2(
-                "50:text/plain:*.txt\n80:text/x-short:*.txt\n80:text/x-long:*.long.txt\n",
-            ),
-            ..Default::default()
-        };
-        assert_eq!(db.glob_types("a.long.txt"), vec!["text/x-long"]);
-        assert_eq!(db.glob_types("a.txt"), vec!["text/x-short"]);
+        assert_eq!(detect("a.long.txt"), "text/x-long");
+        assert_eq!(detect("a.txt"), "text/x-short");
+        assert_eq!(detect("a.TXT"), "text/x-short");
+        assert_eq!(detect("a.CS"), "text/x-cs");
+        assert_eq!(detect("a.cs"), "text/plain");
     }
 
     // -- magic --------------------------------------------------------------
+
+    #[test]
+    fn matches_a_rule_as_update_mime_database_writes_it() {
+        let entries = parse_magic(b"MIME-Magic\0\n[50:image/png]\n>0=\x00\x04\x89PNG\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mime, "image/png");
+        assert!(magic_entry_matches(&entries[0], b"\x89PNG\r\n\x1a\n"));
+        assert!(!magic_entry_matches(&entries[0], b"GIF89a"));
+    }
 
     #[test]
     fn parses_and_matches_magic_rules() {
@@ -1232,13 +1064,15 @@ mod tests {
     }
 
     #[test]
-    fn aliases_and_parents_are_transitive() {
+    fn aliases_and_subclasses_are_read_and_followed() {
+        let dir = TempDir::new("aliases");
+        dir.write("mime/aliases", "image/jpg image/jpeg\n");
+        dir.write(
+            "mime/subclasses",
+            "image/svg+xml application/xml\napplication/xml text/plain\n",
+        );
         let mut db = MimeDatabase::default();
-        db.aliases.insert("image/jpg".into(), "image/jpeg".into());
-        db.parents
-            .insert("image/svg+xml".into(), vec!["application/xml".into()]);
-        db.parents
-            .insert("application/xml".into(), vec!["text/plain".into()]);
+        db.load_mime_dir(&dir.0.join("mime"));
 
         assert_eq!(db.unalias("image/jpg"), "image/jpeg");
         assert_eq!(
@@ -1247,6 +1081,11 @@ mod tests {
         );
         assert!(db.mime_type_subclass("image/svg+xml", "text/plain"));
         assert!(!db.mime_type_subclass("text/plain", "image/svg+xml"));
+    }
+
+    #[test]
+    fn scheme_mime_types_are_lowercase() {
+        assert_eq!(scheme_mime("HTTPS"), "x-scheme-handler/https");
     }
 
     // -- mimeapps -----------------------------------------------------------
@@ -1266,23 +1105,17 @@ mod tests {
         );
 
         let entries = vec![
-            entry("first.desktop", None),
-            entry("second.desktop", None),
-            entry("third.desktop", None),
+            entry("first", None),
+            entry("second", None),
+            entry("third", None),
         ];
-        let resolver = Resolver::from_parts(MimeDatabase::default(), vec![first, second], entries);
+        let resolver = resolver(MimeDatabase::default(), vec![first, second], entries);
 
-        assert_eq!(resolver.resolve("text/html"), Some("first.desktop".into()));
+        assert_eq!(resolved(&resolver, "text/html"), Some("first"));
         // A removal in a lower-priority file must not remove a higher one.
-        assert_eq!(
-            resolver.resolve("application/x-a"),
-            Some("first.desktop".into())
-        );
+        assert_eq!(resolved(&resolver, "application/x-a"), Some("first"));
         // A higher-priority removal filters a lower-priority addition.
-        assert_eq!(
-            resolver.resolve("application/x-b"),
-            Some("third.desktop".into())
-        );
+        assert_eq!(resolved(&resolver, "application/x-b"), Some("third"));
     }
 
     #[test]
@@ -1294,38 +1127,25 @@ mod tests {
             .insert("text/x-markdown".into(), vec!["text/plain".into()]);
 
         let entries = vec![
-            entry("python.desktop", Some("text/x-python;")),
-            entry("plain.desktop", Some("text/plain;")),
+            entry("python", Some("text/x-python;")),
+            entry("plain", Some("text/plain;")),
         ];
-        let resolver = Resolver::from_parts(db, Vec::new(), entries);
+        let resolver = resolver(db, Vec::new(), entries);
 
-        assert_eq!(
-            resolver.resolve("text/x-python"),
-            Some("python.desktop".into())
-        );
-        assert_eq!(
-            resolver.resolve("text/x-markdown"),
-            Some("plain.desktop".into())
-        );
+        assert_eq!(resolved(&resolver, "text/x-python"), Some("python"));
+        assert_eq!(resolved(&resolver, "text/x-markdown"), Some("plain"));
     }
 
     #[test]
-    fn mimeapps_ignores_missing_desktop_entries() {
-        let file = parse_mimeapps("[Default Applications]\ntext/html=missing.desktop;\n");
-        let resolver = Resolver::from_parts(MimeDatabase::default(), vec![file], Vec::new());
-        assert_eq!(resolver.resolve("text/html"), None);
-    }
-
-    #[test]
-    fn web_browser_uses_text_html_then_http() {
+    fn mimeapps_skips_ids_that_are_not_installed() {
         let file =
-            parse_mimeapps("[Default Applications]\nx-scheme-handler/http=browser.desktop;\n");
-        let resolver = Resolver::from_parts(
+            parse_mimeapps("[Default Applications]\ntext/html=missing.desktop;present.desktop;\n");
+        let resolver = resolver(
             MimeDatabase::default(),
             vec![file],
-            vec![entry("browser.desktop", None)],
+            vec![entry("present", None)],
         );
-        assert_eq!(web_browser(&resolver), Some("browser.desktop".into()));
+        assert_eq!(resolved(&resolver, "text/html"), Some("present"));
     }
 
     // -- writer -------------------------------------------------------------
@@ -1343,27 +1163,23 @@ mod tests {
             &dir.0,
             "new.desktop",
             &["image/png".into(), "image/jpeg".into()],
-            false,
         )
         .unwrap();
 
         let content = fs::read_to_string(dir.0.join("mimeapps.list")).unwrap();
-        assert!(content.contains("# keep me"));
-        assert!(content.contains("image/png=new.desktop;"));
-        assert!(content.contains("image/jpeg=new.desktop;"));
-        assert!(!content.contains("image/png=old.desktop;"));
-        assert!(content.contains("# tail"));
-        assert!(content.contains("[Added Associations]"));
-        assert!(content.contains("text/html=x.desktop;"));
+        assert_eq!(
+            content,
+            "# keep me\n[Default Applications]\n# tail\nimage/png=new.desktop;\n\
+             image/jpeg=new.desktop;\n[Added Associations]\ntext/html=x.desktop;\n"
+        );
     }
 
     #[test]
     fn writer_creates_missing_file() {
         let dir = TempDir::new("writer-new");
-        set_default_in(&dir.0, "app.desktop", &["text/plain".into()], false).unwrap();
+        set_default_in(&dir.0, "app.desktop", &["text/plain".into()]).unwrap();
         let content = fs::read_to_string(dir.0.join("mimeapps.list")).unwrap();
-        assert!(content.contains("[Default Applications]"));
-        assert!(content.contains("text/plain=app.desktop;"));
+        assert_eq!(content, "[Default Applications]\ntext/plain=app.desktop;\n");
     }
 
     #[test]
@@ -1372,7 +1188,7 @@ mod tests {
         dir.write("real.list", "[Default Applications]\n");
         std::os::unix::fs::symlink("real.list", dir.0.join("mimeapps.list")).unwrap();
 
-        set_default_in(&dir.0, "app.desktop", &["text/plain".into()], false).unwrap();
+        set_default_in(&dir.0, "app.desktop", &["text/plain".into()]).unwrap();
 
         let link = dir.0.join("mimeapps.list");
         assert!(fs::symlink_metadata(&link)
@@ -1384,23 +1200,10 @@ mod tests {
     }
 
     #[test]
-    fn writer_rejects_read_only_files() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new("writer-readonly");
-        let path = dir.write("mimeapps.list", "[Default Applications]\n");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
-
-        let error =
-            set_default_in(&dir.0, "app.desktop", &["text/plain".into()], false).unwrap_err();
-        assert_eq!(error.code, 6);
-    }
-
-    #[test]
     fn writer_requires_desktop_suffix() {
         let dir = TempDir::new("writer-suffix");
-        let error = set_default_in(&dir.0, "firefox", &["text/plain".into()], false).unwrap_err();
-        assert_eq!(error.code, 1);
+        let error = set_default_in(&dir.0, "firefox", &["text/plain".into()]).unwrap_err();
+        assert_eq!(error.code, Failure::USAGE);
     }
 
     #[test]
@@ -1410,7 +1213,7 @@ mod tests {
             "mimeapps.list",
             "[Default Applications]\ntext/plain=a.desktop;\ntext/plain=b.desktop;\n",
         );
-        set_default_in(&dir.0, "c.desktop", &["text/plain".into()], false).unwrap();
+        set_default_in(&dir.0, "c.desktop", &["text/plain".into()]).unwrap();
         let content = fs::read_to_string(dir.0.join("mimeapps.list")).unwrap();
         assert_eq!(content.matches("text/plain=").count(), 1);
         assert!(content.contains("text/plain=c.desktop;"));

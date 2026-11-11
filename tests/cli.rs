@@ -42,11 +42,12 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vesper"))
 }
 
-fn base_command() -> Command {
-    let mut cmd = Command::new(bin());
-    cmd.env("XDG_DATA_HOME", root().join("fixtures"))
+/// A command with every lookup pointed at `data_home` and `config_home`.
+fn command(program: &Path, data_home: &Path, config_home: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("XDG_DATA_HOME", data_home)
         .env("XDG_DATA_DIRS", "/nonexistent")
-        .env("XDG_CONFIG_HOME", root().join("fixtures"))
+        .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_CONFIG_DIRS", "/nonexistent")
         .env("HOME", "/tmp")
         .env("XDG_CURRENT_DESKTOP", "niri")
@@ -56,30 +57,24 @@ fn base_command() -> Command {
     cmd
 }
 
+fn fixtures() -> PathBuf {
+    root().join("fixtures")
+}
+
 fn run(args: &[&str]) -> Output {
-    base_command().args(args).output().unwrap()
+    run_linked(&bin(), args)
 }
 
 fn run_with_xdg(args: &[&str], data_home: &Path, config_home: &Path) -> Output {
-    base_command()
-        .env("XDG_DATA_HOME", data_home)
-        .env("XDG_CONFIG_HOME", config_home)
+    command(&bin(), data_home, config_home)
         .args(args)
         .output()
         .unwrap()
 }
 
-fn run_linked(link: &Path, args: &[&str]) -> Output {
-    Command::new(link)
-        .env("XDG_DATA_HOME", root().join("fixtures"))
-        .env("XDG_DATA_DIRS", "/nonexistent")
-        .env("XDG_CONFIG_HOME", root().join("fixtures"))
-        .env("XDG_CONFIG_DIRS", "/nonexistent")
-        .env("HOME", "/tmp")
-        .env("XDG_CURRENT_DESKTOP", "niri")
-        .env_remove("BROWSER")
-        .env_remove("VESPER_FALLBACKS")
-        .env_remove("TERMINAL")
+/// Run `program` (the binary or a symlink to it) against the fixtures.
+fn run_linked(program: &Path, args: &[&str]) -> Output {
+    command(program, &fixtures(), &fixtures())
         .args(args)
         .output()
         .unwrap()
@@ -102,8 +97,21 @@ fn list_reads_fixture_entries() {
     let output = run(&["list"]);
     assert_eq!(code(&output), 0);
     let text = stdout(&output);
-    assert!(text.contains("Test Browser\t"));
-    assert!(text.contains("\ttest-browser"));
+    assert!(text
+        .lines()
+        .any(|line| line == "Test Browser\ttest-browser"));
+}
+
+#[test]
+fn list_keeps_one_line_per_entry_when_a_name_holds_separators() {
+    let dir = TempDir::new("list-tsv");
+    dir.write(
+        "data/applications/tab.desktop",
+        "[Desktop Entry]\nType=Application\nName=A\\tB\\nC\nExec=prog\n",
+    );
+
+    let output = run_with_xdg(&["list"], &dir.0.join("data"), &dir.0.join("config"));
+    assert_eq!(stdout(&output), "A B C\ttab\n");
 }
 
 #[test]
@@ -135,6 +143,7 @@ fn mime_query_default_reads_mimeapps() {
 fn open_reports_missing_and_unassociated_targets() {
     let output = run(&["open", "/nonexistent/thing.svg"]);
     assert_eq!(code(&output), 2);
+    assert!(stderr(&output).contains("does not exist"));
 
     let binary = root().join("fixtures/test.bin");
     let output = run(&["open", binary.to_str().unwrap()]);
@@ -146,7 +155,7 @@ fn open_launches_the_resolved_entry() {
     let dir = TempDir::new("open-success");
     dir.write(
         "data/applications/run.desktop",
-        "[Desktop Entry]\nType=Application\nName=Run\nExec=true %f\n",
+        "[Desktop Entry]\nType=Application\nName=Run\nExec=cat %f\n",
     );
     dir.write(
         "config/mimeapps.list",
@@ -160,11 +169,29 @@ fn open_launches_the_resolved_entry() {
         &dir.0.join("config"),
     );
     assert_eq!(code(&output), 0);
+    assert_eq!(stdout(&output), "hello\n");
 }
 
 #[test]
 fn settings_read_the_browser_association() {
     let output = run(&["settings", "get", "default-web-browser"]);
+    assert_eq!(code(&output), 0);
+    assert_eq!(stdout(&output).trim(), "test-browser.desktop");
+}
+
+#[test]
+fn web_browser_setting_falls_back_to_the_http_handler() {
+    let dir = TempDir::new("settings-http");
+    dir.write(
+        "config/mimeapps.list",
+        "[Default Applications]\nx-scheme-handler/http=test-browser.desktop;\n",
+    );
+
+    let output = run_with_xdg(
+        &["settings", "get", "default-web-browser"],
+        &fixtures(),
+        &dir.0.join("config"),
+    );
     assert_eq!(code(&output), 0);
     assert_eq!(stdout(&output).trim(), "test-browser.desktop");
 }
@@ -182,7 +209,7 @@ fn writer_updates_the_configured_file() {
             "image/png",
             "image/jpeg",
         ],
-        &root().join("fixtures"),
+        &fixtures(),
         &dir.0.join("config"),
     );
     assert_eq!(code(&output), 0);
@@ -201,7 +228,7 @@ fn writer_fails_on_read_only_config() {
 
     let output = run_with_xdg(
         &["mime", "default", "test-editor.desktop", "image/png"],
-        &root().join("fixtures"),
+        &fixtures(),
         &dir.0.join("config"),
     );
     assert_eq!(code(&output), 6);
@@ -223,7 +250,7 @@ fn xdg_open_name_is_a_drop_in() {
 
     dir.write(
         "data/applications/run.desktop",
-        "[Desktop Entry]\nType=Application\nName=Run\nExec=true %f\n",
+        "[Desktop Entry]\nType=Application\nName=Run\nExec=cat %f\n",
     );
     dir.write("data/mime/globs2", "50:image/svg+xml:*.svg\n");
     dir.write(
@@ -232,20 +259,13 @@ fn xdg_open_name_is_a_drop_in() {
     );
     let svg = dir.write("icon.svg", "<svg/>\n");
 
-    let output = Command::new(&link)
-        .env("XDG_DATA_HOME", dir.0.join("data"))
-        .env("XDG_DATA_DIRS", "/nonexistent")
-        .env("XDG_CONFIG_HOME", dir.0.join("config"))
-        .env("XDG_CONFIG_DIRS", "/nonexistent")
-        .env("HOME", "/tmp")
-        .env("XDG_CURRENT_DESKTOP", "niri")
-        .env_remove("BROWSER")
-        .env_remove("VESPER_FALLBACKS")
+    let output = command(&link, &dir.0.join("data"), &dir.0.join("config"))
         .arg(svg.to_str().unwrap())
         .output()
         .unwrap();
 
     assert_eq!(code(&output), 0);
+    assert_eq!(stdout(&output), "<svg/>\n");
 }
 
 #[test]
@@ -260,6 +280,7 @@ fn xdg_mime_name_maps_to_mime_queries() {
 
     let output = run_linked(&link, &["query", "filetype", "/nonexistent"]);
     assert_eq!(code(&output), 2);
+    assert!(stderr(&output).contains("does not exist"));
 }
 
 #[test]
@@ -278,7 +299,7 @@ fn v_name_opens_multiple_targets() {
     let dir = TempDir::new("v-name");
     dir.write(
         "data/applications/run.desktop",
-        "[Desktop Entry]\nType=Application\nName=Run\nExec=true %f\n",
+        "[Desktop Entry]\nType=Application\nName=Run\nExec=cat %f\n",
     );
     dir.write(
         "config/mimeapps.list",
@@ -290,18 +311,14 @@ fn v_name_opens_multiple_targets() {
     let link = dir.0.join("v");
     std::os::unix::fs::symlink(bin(), &link).unwrap();
 
-    let output = Command::new(&link)
-        .env("XDG_DATA_HOME", dir.0.join("data"))
-        .env("XDG_DATA_DIRS", "/nonexistent")
-        .env("XDG_CONFIG_HOME", dir.0.join("config"))
-        .env("XDG_CONFIG_DIRS", "/nonexistent")
-        .env("HOME", "/tmp")
-        .env("XDG_CURRENT_DESKTOP", "niri")
-        .env_remove("BROWSER")
-        .env_remove("VESPER_FALLBACKS")
+    let output = command(&link, &dir.0.join("data"), &dir.0.join("config"))
         .args([first.to_str().unwrap(), second.to_str().unwrap()])
         .output()
         .unwrap();
 
     assert_eq!(code(&output), 0);
+    // Both run detached from `v`, so their order is not fixed.
+    let text = stdout(&output);
+    assert!(text.contains("one\n"));
+    assert!(text.contains("two\n"));
 }

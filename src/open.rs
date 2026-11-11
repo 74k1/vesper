@@ -3,62 +3,29 @@
 // ---------------------------------------------------------------------------
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::desktop;
 use crate::exec;
-use crate::launch::{self, LaunchMode, Target};
+use crate::failure::Failure;
+use crate::launch::{self, LaunchMode};
 use crate::mime::{self, Resolver};
 use crate::xdg;
 
-/// Failure of an `open` request, carrying the xdg-open exit code.
-#[derive(Debug)]
-pub enum OpenError {
-    Usage(String),
-    Missing(String),
-    NoAssociation(String),
-    Launch(String),
-    ReadPermission(String),
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    File(PathBuf),
+    Url { url: String, scheme: String },
 }
 
-impl OpenError {
-    pub fn code(&self) -> i32 {
-        match self {
-            OpenError::Usage(_) => 1,
-            OpenError::Missing(_) => 2,
-            OpenError::NoAssociation(_) => 3,
-            OpenError::Launch(_) => 4,
-            OpenError::ReadPermission(_) => 5,
-        }
-    }
-
-    pub fn message(&self) -> &str {
-        match self {
-            OpenError::Usage(message)
-            | OpenError::Missing(message)
-            | OpenError::NoAssociation(message)
-            | OpenError::Launch(message)
-            | OpenError::ReadPermission(message) => message,
-        }
-    }
-}
-
-impl std::fmt::Display for OpenError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.message())
-    }
-}
-
-impl std::error::Error for OpenError {}
-
-/// Open a file path or URL with the resolved desktop entry.
+/// Open a file path or URL with the resolved desktop entry. `terminal` is
+/// the `--terminal` override for `Terminal=true` entries.
 pub fn open_target(
     target: &str,
     terminal: Option<&str>,
     mode: LaunchMode,
     resolver: &Resolver,
-) -> Result<(), OpenError> {
+) -> Result<(), Failure> {
     open_depth(target, terminal, mode, resolver, 0)
 }
 
@@ -68,83 +35,79 @@ fn open_depth(
     mode: LaunchMode,
     resolver: &Resolver,
     depth: u8,
-) -> Result<(), OpenError> {
+) -> Result<(), Failure> {
     if depth > 8 {
-        return Err(OpenError::Launch("link loop".into()));
+        return Err(Failure::new(Failure::LAUNCH, "link loop"));
     }
 
-    let parsed = parse_target(target)?;
-    let parsed = match parsed {
+    let (mime, argument, is_url) = match parse_target(target)? {
         Target::File(path) => {
             if !path.exists() {
-                return Err(OpenError::Missing(format!(
-                    "{} does not exist",
-                    path.display()
-                )));
+                return Err(Failure::new(
+                    Failure::MISSING,
+                    format!("{} does not exist", path.display()),
+                ));
             }
             if path.is_file() && fs::File::open(&path).is_err() {
-                return Err(OpenError::ReadPermission(format!(
-                    "no permission to read {}",
-                    path.display()
-                )));
+                return Err(Failure::new(
+                    Failure::READ,
+                    format!("no permission to read {}", path.display()),
+                ));
             }
-            Target::File(fs::canonicalize(&path).unwrap_or(path))
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            (
+                resolver.detect(&path),
+                path.to_string_lossy().into_owned(),
+                false,
+            )
         }
-        Target::Url(url) => Target::Url(url),
+        Target::Url { url, scheme } => (mime::scheme_mime(&scheme), url, true),
     };
 
-    let mime = match &parsed {
-        Target::File(path) => resolver.detect(path),
-        Target::Url(url) => scheme_mime(url)?,
-    };
-
-    let id = match resolver.resolve(&mime) {
-        Some(id) => id,
-        None => {
-            if run_fallbacks(&mime, target, mode)? {
-                return Ok(());
-            }
-            return Err(OpenError::NoAssociation(format!(
-                "no application for {}",
-                mime
-            )));
+    let Some(entry) = resolver.resolve(&mime) else {
+        if run_fallbacks(&mime, target, mode) {
+            return Ok(());
         }
+        return Err(Failure::new(
+            Failure::NO_ASSOCIATION,
+            format!("no application for {}", mime),
+        ));
     };
-
-    let entry = desktop::find_entry(&id)
-        .map_err(|_| OpenError::NoAssociation(format!("no desktop entry for {}", id)))?;
 
     match entry.type_() {
-        "Application" => {
-            let terminal_cmd = launch::resolve_terminal(terminal.map(str::to_string));
-            launch::launch_target(&entry, &terminal_cmd, Some(&parsed), mode)
-                .map_err(|err| OpenError::Launch(err.to_string()))
-        }
+        "Application" => launch::launch(entry, terminal, &[argument], is_url, mode)
+            .map_err(|err| Failure::new(Failure::LAUNCH, err.to_string())),
         "Link" => {
             let url = entry.url().ok_or_else(|| {
-                OpenError::NoAssociation(format!("{} is a Link without a URL", entry.id))
+                Failure::new(
+                    Failure::NO_ASSOCIATION,
+                    format!("{} is a Link without a URL", entry.id),
+                )
             })?;
             open_depth(url, terminal, mode, resolver, depth + 1)
         }
-        other => Err(OpenError::NoAssociation(format!(
-            "{} entries are not runnable",
-            other
-        ))),
+        other => Err(Failure::new(
+            Failure::NO_ASSOCIATION,
+            format!("{} entries are not runnable", other),
+        )),
     }
 }
 
 /// Parse a file path, `file:` URI, or URL with a scheme.
-pub fn parse_target(target: &str) -> Result<Target, OpenError> {
+fn parse_target(target: &str) -> Result<Target, Failure> {
     if target.is_empty() {
-        return Err(OpenError::Usage("empty target".into()));
+        return Err(Failure::new(Failure::USAGE, "empty target"));
     }
 
     if let Some(rest) = target.strip_prefix("file:") {
         return Ok(Target::File(decode_file_uri(rest)?));
     }
 
-    if url_scheme(target).is_some() {
-        return Ok(Target::Url(target.to_string()));
+    if let Some(scheme) = url_scheme(target) {
+        return Ok(Target::Url {
+            url: target.to_string(),
+            scheme: scheme.to_string(),
+        });
     }
 
     Ok(Target::File(xdg::expand_tilde(target)))
@@ -162,51 +125,66 @@ fn url_scheme(value: &str) -> Option<&str> {
     Some(scheme)
 }
 
-fn decode_file_uri(rest: &str) -> Result<PathBuf, OpenError> {
+fn decode_file_uri(rest: &str) -> Result<PathBuf, Failure> {
     let rest = rest.trim_start_matches("//");
 
-    if !rest.contains('/') {
-        return Ok(PathBuf::from(xdg::percent_decode(rest)));
-    }
-
-    let (authority, path) = if let Some(stripped) = rest.strip_prefix('/') {
-        ("", format!("/{stripped}"))
-    } else {
-        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        (authority, format!("/{path}"))
+    let Some(slash) = rest.find('/') else {
+        return Ok(PathBuf::from(percent_decode(rest)));
     };
+    let (authority, path) = rest.split_at(slash);
 
     if !authority.is_empty() && authority != "localhost" {
-        return Err(OpenError::Usage(format!(
-            "unsupported file URI authority '{}'",
-            authority
-        )));
+        return Err(Failure::new(
+            Failure::USAGE,
+            format!("unsupported file URI authority '{}'", authority),
+        ));
     }
 
-    Ok(PathBuf::from(xdg::percent_decode(&path)))
+    Ok(PathBuf::from(percent_decode(path)))
 }
 
-fn scheme_mime(url: &str) -> Result<String, OpenError> {
-    let scheme = url_scheme(url)
-        .ok_or_else(|| OpenError::Usage(format!("not a URL with a scheme: {}", url)))?;
-    Ok(mime::scheme_mime(scheme))
+fn percent_decode(s: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|digit| digit as u8);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Try `$BROWSER` for URL schemes and `$VESPER_FALLBACKS` for any type.
-fn run_fallbacks(mime: &str, target: &str, mode: LaunchMode) -> Result<bool, OpenError> {
+/// A colon-separated list of commands from the environment, in order of
+/// preference.
+fn env_commands(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn run_fallbacks(mime: &str, target: &str, mode: LaunchMode) -> bool {
     let mut commands = Vec::new();
     if mime.starts_with("x-scheme-handler/") {
-        commands.extend(xdg::browser_commands());
+        commands.extend(env_commands("BROWSER"));
     }
-    commands.extend(xdg::fallback_commands());
+    commands.extend(env_commands("VESPER_FALLBACKS"));
 
-    for command in commands {
-        if run_fallback_command(&command, target, mode) {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+    commands
+        .iter()
+        .any(|command| run_fallback_command(command, target, mode))
 }
 
 fn run_fallback_command(command: &str, target: &str, mode: LaunchMode) -> bool {
@@ -218,12 +196,7 @@ fn run_fallback_command(command: &str, target: &str, mode: LaunchMode) -> bool {
         }
     };
 
-    if tokens.is_empty() {
-        return false;
-    }
-
-    let substituted = tokens.iter().any(|token| token.contains("%s"));
-    if substituted {
+    if tokens.iter().any(|token| token.contains("%s")) {
         for token in &mut tokens {
             *token = token.replace("%s", target);
         }
@@ -231,110 +204,78 @@ fn run_fallback_command(command: &str, target: &str, mode: LaunchMode) -> bool {
         tokens.push(target.to_string());
     }
 
-    let program = tokens.remove(0);
-    if is_self(&program) {
+    let Some((program, args)) = tokens.split_first() else {
+        return false;
+    };
+    if is_self(program) {
         return false;
     }
 
-    let mut cmd = Command::new(&program);
-    cmd.args(&tokens);
+    let mut cmd = Command::new(program);
+    cmd.args(args);
 
-    match mode {
-        LaunchMode::Replace => {
-            use std::os::unix::process::CommandExt;
-            let err = cmd.exec();
-            eprintln!("vesper: fallback '{}' failed: {}", command, err);
+    match launch::execute(cmd, mode) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "vesper: fallback '{}' failed: {}",
+                command,
+                err.root_cause()
+            );
             false
         }
-        _ => match cmd.spawn() {
-            Ok(_) => true,
-            Err(err) => {
-                eprintln!("vesper: fallback '{}' failed: {}", command, err);
-                false
-            }
-        },
     }
 }
 
+/// A fallback naming this program would recurse forever.
 fn is_self(program: &str) -> bool {
-    let name = std::path::Path::new(program)
+    Path::new(program)
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    matches!(name.as_str(), "vesper" | "v" | "xdg-open")
+        .is_some_and(|name| name == "vesper" || name == "v" || name == "xdg-open")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+
+    fn file(path: &str) -> Target {
+        Target::File(PathBuf::from(path))
+    }
+
+    fn url(url: &str, scheme: &str) -> Target {
+        Target::Url {
+            url: url.into(),
+            scheme: scheme.into(),
+        }
+    }
 
     #[test]
     fn parses_paths_urls_and_file_uris() {
+        let parse = |target| parse_target(target).unwrap();
+
+        assert_eq!(parse("x.svg"), file("x.svg"));
         assert_eq!(
-            parse_target("x.svg").unwrap(),
-            Target::File(PathBuf::from("x.svg"))
+            parse("https://example.com"),
+            url("https://example.com", "https")
         );
+        assert_eq!(parse("mailto:a@b"), url("mailto:a@b", "mailto"));
+        assert_eq!(parse("file:///tmp/a%20b.txt"), file("/tmp/a b.txt"));
+        assert_eq!(parse("file://localhost/tmp/x"), file("/tmp/x"));
+        assert_eq!(parse("file:/tmp/x"), file("/tmp/x"));
         assert_eq!(
-            parse_target("https://example.com").unwrap(),
-            Target::Url("https://example.com".into())
+            parse_target("file://remote/tmp/x").unwrap_err().code,
+            Failure::USAGE
         );
-        assert_eq!(
-            parse_target("mailto:a@b").unwrap(),
-            Target::Url("mailto:a@b".into())
-        );
-        assert_eq!(
-            parse_target("file:///tmp/a%20b.txt").unwrap(),
-            Target::File(PathBuf::from("/tmp/a b.txt"))
-        );
-        assert_eq!(
-            parse_target("file://localhost/tmp/x").unwrap(),
-            Target::File(PathBuf::from("/tmp/x"))
-        );
-        assert_eq!(
-            parse_target("file:/tmp/x").unwrap(),
-            Target::File(PathBuf::from("/tmp/x"))
-        );
-        assert!(matches!(
-            parse_target("file://remote/tmp/x"),
-            Err(OpenError::Usage(_))
-        ));
+        assert_eq!(parse_target("").unwrap_err().code, Failure::USAGE);
     }
 
     #[test]
-    fn maps_schemes_to_mime_types() {
-        assert_eq!(
-            scheme_mime("HTTPS://example.com").unwrap(),
-            "x-scheme-handler/https"
-        );
-        assert_eq!(
-            scheme_mime("mailto:a@b").unwrap(),
-            "x-scheme-handler/mailto"
-        );
-        assert!(matches!(scheme_mime("not a url"), Err(OpenError::Usage(_))));
-    }
+    fn file_uris_decode_percent_escapes_and_keep_malformed_ones() {
+        let parse = |target| parse_target(target).unwrap();
 
-    #[test]
-    fn missing_targets_exit_two() {
-        let dir = TempDir::new("open-missing");
-        let resolver = Resolver::empty();
-        let error = open_target(
-            dir.0.join("nope.svg").to_str().unwrap(),
-            None,
-            LaunchMode::Spawn,
-            &resolver,
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), 2);
-    }
-
-    #[test]
-    fn unassociated_targets_exit_three() {
-        let dir = TempDir::new("open-noassoc");
-        let file = dir.write("note.txt", "text\n");
-        let resolver = Resolver::empty();
-        let error =
-            open_target(file.to_str().unwrap(), None, LaunchMode::Spawn, &resolver).unwrap_err();
-        assert_eq!(error.code(), 3);
+        assert_eq!(parse("file:///tmp/100%25"), file("/tmp/100%"));
+        assert_eq!(parse("file:///tmp/bad%zz"), file("/tmp/bad%zz"));
+        assert_eq!(parse("file:%2Ftmp%2Ffile"), file("/tmp/file"));
+        assert_eq!(parse("file:///tmp/end%20"), file("/tmp/end "));
     }
 }

@@ -4,9 +4,11 @@
 
 mod desktop;
 mod exec;
+mod failure;
 mod launch;
 mod mime;
 mod open;
+mod settings;
 #[cfg(test)]
 mod test_support;
 mod xdg;
@@ -14,9 +16,13 @@ mod xdg;
 use std::path::Path;
 
 use clap::{Parser, Subcommand};
+use eyre::{eyre, ContextCompat};
 
 use crate::desktop::DesktopEntry;
+use crate::failure::Failure;
 use crate::launch::LaunchMode;
+use crate::mime::Resolver;
+use crate::settings::Setting;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -218,29 +224,25 @@ fn run_vesper(args: Vec<String>) -> i32 {
                         })
                     })
                     .collect();
-                match serde_json::to_string_pretty(&values) {
-                    Ok(text) => println!("{text}"),
-                    Err(err) => {
-                        eprintln!("vesper: {err}");
-                        return 1;
-                    }
-                }
-            } else if ids {
-                for entry in &filtered {
+                return report(
+                    serde_json::to_string_pretty(&values)
+                        .map(|text| println!("{text}"))
+                        .map_err(Into::into),
+                );
+            }
+
+            for entry in &filtered {
+                if ids {
                     println!("{}", entry.id);
-                }
-            } else if icons {
-                for entry in &filtered {
+                } else if icons {
                     println!(
                         "{}\t{}\t{}",
-                        xdg::tsv_field(entry.name()),
+                        tsv_field(entry.name()),
                         entry.id,
-                        xdg::tsv_field(entry.icon().unwrap_or(""))
+                        tsv_field(entry.icon().unwrap_or(""))
                     );
-                }
-            } else {
-                for entry in &filtered {
-                    println!("{}\t{}", xdg::tsv_field(entry.name()), entry.id);
+                } else {
+                    println!("{}\t{}", tsv_field(entry.name()), entry.id);
                 }
             }
             0
@@ -251,56 +253,34 @@ fn run_vesper(args: Vec<String>) -> i32 {
             terminal,
             detach,
             args,
-        } => match desktop::find_entry(&id_or_path) {
-            Ok(entry) => {
-                let terminal_cmd = launch::resolve_terminal(terminal);
-                match launch::run_entry(&entry, &terminal_cmd, &args, detach) {
-                    Ok(()) => 0,
-                    Err(err) => {
-                        eprintln!("vesper: {:#}", err);
-                        1
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("vesper: {:#}", err);
-                1
-            }
-        },
+        } => report(run_entry(
+            &id_or_path,
+            terminal.as_deref(),
+            &args,
+            launch_mode(detach),
+        )),
 
         Commands::Open {
             target,
             terminal,
             detach,
-        } => {
-            let resolver = mime::Resolver::load();
-            let mode = if detach {
-                LaunchMode::Detach
-            } else {
-                LaunchMode::Replace
-            };
-            match open::open_target(&target, terminal.as_deref(), mode, &resolver) {
-                Ok(()) => 0,
-                Err(err) => {
-                    eprintln!("vesper: {}", err.message());
-                    err.code()
-                }
-            }
-        }
+        } => exit_code(
+            "vesper",
+            open::open_target(
+                &target,
+                terminal.as_deref(),
+                launch_mode(detach),
+                &Resolver::load(),
+            ),
+        ),
 
         Commands::Inspect {
             id_or_path,
             terminal,
-        } => match desktop::find_entry(&id_or_path) {
-            Ok(entry) => {
-                inspect_entry(&entry, &launch::resolve_terminal(terminal));
-                0
-            }
-            Err(err) => {
-                eprintln!("vesper: {:#}", err);
-                1
-            }
-        },
+        } => report(
+            desktop::find_entry(&id_or_path)
+                .map(|entry| inspect_entry(&entry, terminal.as_deref())),
+        ),
 
         Commands::Autostart {
             desktop,
@@ -317,16 +297,17 @@ fn run_vesper(args: Vec<String>) -> i32 {
                 if entries.is_empty() {
                     eprintln!("No autostart entries for desktop '{}'", desktop);
                 }
-                let terminal = launch::resolve_terminal(terminal);
                 for entry in &entries {
                     eprintln!("Running: {} ({})", entry.name(), entry.path.display());
-                    if let Err(err) = launch::spawn_entry(entry, &terminal) {
+                    if let Err(err) =
+                        launch::launch(entry, terminal.as_deref(), &[], false, LaunchMode::Spawn)
+                    {
                         eprintln!("  error: {:#}", err);
                     }
                 }
             } else {
                 for entry in &entries {
-                    println!("{}\t{}", xdg::tsv_field(entry.name()), entry.id);
+                    println!("{}\t{}", tsv_field(entry.name()), entry.id);
                 }
             }
             0
@@ -334,29 +315,147 @@ fn run_vesper(args: Vec<String>) -> i32 {
 
         Commands::Mime { command } => match command {
             MimeCommands::Query { query } => match query {
-                MimeQuery::Filetype { file } => filetype_exit(&file, "vesper"),
-                MimeQuery::Default { mime } => {
-                    let resolver = mime::Resolver::load();
-                    if let Some(id) = resolver.resolve(&mime) {
-                        println!("{id}");
-                    }
-                    0
-                }
+                MimeQuery::Filetype { file } => query_filetype(&file, "vesper"),
+                MimeQuery::Default { mime } => query_default(&mime),
             },
             MimeCommands::Default { app, mimes } => {
-                if mimes.is_empty() {
-                    eprintln!("vesper: no MIME type given");
-                    return 1;
+                let code = exit_code("vesper", mime::set_default(&app, &mimes));
+                if code == 0 && desktop::find_by_id(&app).is_none() {
+                    eprintln!(
+                        "vesper: warning: {} is not a discoverable desktop entry",
+                        app
+                    );
                 }
-                set_default_exit(&app, &mimes, "vesper", true)
+                code
             }
         },
 
-        Commands::Settings { command } => match command {
-            SettingsCommands::Get { property, rest } => settings_get(&property, &rest, "vesper"),
-            SettingsCommands::Set { property, rest } => settings_set(&property, &rest, "vesper"),
-            SettingsCommands::Check { property, rest } => settings_check(&property, &rest),
+        Commands::Settings { command } => {
+            let (verb, property, rest) = match command {
+                SettingsCommands::Get { property, rest } => (SettingsVerb::Get, property, rest),
+                SettingsCommands::Set { property, rest } => (SettingsVerb::Set, property, rest),
+                SettingsCommands::Check { property, rest } => (SettingsVerb::Check, property, rest),
+            };
+            settings(verb, &property, &rest, "vesper")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared command bodies
+// ---------------------------------------------------------------------------
+
+fn launch_mode(detach: bool) -> LaunchMode {
+    if detach {
+        LaunchMode::Detach
+    } else {
+        LaunchMode::Replace
+    }
+}
+
+fn print_version() {
+    println!("vesper {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Replace characters that would break the tab-separated output format.
+fn tsv_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+fn report(result: eyre::Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("vesper: {:#}", err);
+            1
+        }
+    }
+}
+
+fn exit_code(prefix: &str, result: Result<(), Failure>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(failure) => {
+            eprintln!("{}: {}", prefix, failure.message);
+            failure.code
+        }
+    }
+}
+
+fn run_entry(
+    id_or_path: &str,
+    terminal: Option<&str>,
+    args: &[String],
+    mode: LaunchMode,
+) -> eyre::Result<()> {
+    let entry = desktop::find_entry(id_or_path)?;
+    if entry.type_() == "Link" {
+        let url = entry.url().context("Link entry has no URL key")?;
+        return open::open_target(url, terminal, mode, &Resolver::load())
+            .map_err(|failure| eyre!(failure.message));
+    }
+    launch::launch(&entry, terminal, args, false, mode)
+}
+
+fn query_filetype(file: &str, prefix: &str) -> i32 {
+    let path = xdg::expand_tilde(file);
+    let result = if path.exists() {
+        println!("{}", mime::MimeDatabase::load().detect(&path));
+        Ok(())
+    } else {
+        Err(Failure::new(
+            Failure::MISSING,
+            format!("file '{}' does not exist", file),
+        ))
+    };
+    exit_code(prefix, result)
+}
+
+fn query_default(mime: &str) -> i32 {
+    print_entry_id(Resolver::load().resolve(mime))
+}
+
+/// Print the entry's `.desktop` ID; no entry prints nothing and still
+/// succeeds, as xdg-mime and xdg-settings do.
+fn print_entry_id(entry: Option<&DesktopEntry>) -> i32 {
+    if let Some(entry) = entry {
+        println!("{}", entry.desktop_file_id());
+    }
+    0
+}
+
+enum SettingsVerb {
+    Get,
+    Set,
+    Check,
+}
+
+fn settings(verb: SettingsVerb, property: &str, rest: &[String], prefix: &str) -> i32 {
+    let parsed = Setting::parse(property, rest);
+    match verb {
+        SettingsVerb::Get => match parsed {
+            Ok((setting, _)) => print_entry_id(setting.get(&Resolver::load())),
+            Err(failure) => exit_code(prefix, Err(failure)),
         },
+        SettingsVerb::Set => exit_code(
+            prefix,
+            parsed.and_then(|(setting, rest)| match rest.first() {
+                Some(app) => setting.set(app),
+                None => Err(Failure::new(
+                    Failure::USAGE,
+                    format!("{} needs an application", property),
+                )),
+            }),
+        ),
+        SettingsVerb::Check => {
+            let Ok((setting, [app, ..])) = parsed else {
+                return 1;
+            };
+            let current = setting
+                .get(&Resolver::load())
+                .map(DesktopEntry::desktop_file_id);
+            i32::from(current.as_ref() != Some(app))
+        }
     }
 }
 
@@ -364,7 +463,7 @@ fn run_vesper(args: Vec<String>) -> i32 {
 // Inspect output
 // ---------------------------------------------------------------------------
 
-fn inspect_entry(entry: &DesktopEntry, terminal_cmd: &str) {
+fn inspect_entry(entry: &DesktopEntry, terminal: Option<&str>) {
     println!("File:       {}", entry.path.display());
     println!("ID:         {}", entry.id);
     println!("Type:       {}", entry.type_());
@@ -395,119 +494,19 @@ fn inspect_entry(entry: &DesktopEntry, terminal_cmd: &str) {
         return;
     }
 
-    match launch::command_for_entry(entry, terminal_cmd, &[], &[]) {
+    match launch::command_for_entry(entry, terminal, &[], false) {
         Ok(cmd) => println!("Action:     {:?}", cmd),
         Err(err) => println!("Action:     (cannot run: {:#})", err),
     }
 }
 
 // ---------------------------------------------------------------------------
-// MIME and settings helpers
-// ---------------------------------------------------------------------------
-
-fn filetype_exit(file: &str, prefix: &str) -> i32 {
-    let path = xdg::expand_tilde(file);
-    if !path.exists() {
-        eprintln!("{}: file '{}' does not exist", prefix, file);
-        return 2;
-    }
-    let database = mime::MimeDatabase::load();
-    println!("{}", database.detect(&path));
-    0
-}
-
-fn set_default_exit(app: &str, mimes: &[String], prefix: &str, warn: bool) -> i32 {
-    match mime::set_default(app, mimes, warn) {
-        Ok(()) => 0,
-        Err(err) => {
-            eprintln!("{}: {}", prefix, err.message);
-            err.code
-        }
-    }
-}
-
-fn settings_get(property: &str, rest: &[String], prefix: &str) -> i32 {
-    let resolver = mime::Resolver::load();
-    match property {
-        "default-web-browser" => {
-            if let Some(id) = mime::web_browser(&resolver) {
-                println!("{id}");
-            }
-            0
-        }
-        "default-url-scheme-handler" => {
-            let Some(scheme) = rest.first() else {
-                eprintln!("{}: default-url-scheme-handler needs a scheme", prefix);
-                return 1;
-            };
-            if let Some(id) = resolver.resolve(&mime::scheme_mime(scheme)) {
-                println!("{id}");
-            }
-            0
-        }
-        other => {
-            eprintln!("{}: unknown property '{}'", prefix, other);
-            1
-        }
-    }
-}
-
-fn settings_set(property: &str, rest: &[String], prefix: &str) -> i32 {
-    match property {
-        "default-web-browser" => {
-            let Some(app) = rest.first() else {
-                eprintln!("{}: default-web-browser needs an application", prefix);
-                return 1;
-            };
-            set_default_exit(app, &mime::web_browser_mimes(), prefix, false)
-        }
-        "default-url-scheme-handler" => {
-            let (Some(scheme), Some(app)) = (rest.first(), rest.get(1)) else {
-                eprintln!(
-                    "{}: default-url-scheme-handler needs a scheme and an application",
-                    prefix
-                );
-                return 1;
-            };
-            set_default_exit(app, &[mime::scheme_mime(scheme)], prefix, false)
-        }
-        other => {
-            eprintln!("{}: unknown property '{}'", prefix, other);
-            1
-        }
-    }
-}
-
-fn settings_check(property: &str, rest: &[String]) -> i32 {
-    let resolver = mime::Resolver::load();
-    match property {
-        "default-web-browser" => {
-            let Some(app) = rest.first() else {
-                return 1;
-            };
-            if mime::web_browser(&resolver).as_deref() == Some(app.as_str()) {
-                0
-            } else {
-                1
-            }
-        }
-        "default-url-scheme-handler" => {
-            let (Some(scheme), Some(app)) = (rest.first(), rest.get(1)) else {
-                return 1;
-            };
-            if resolver.resolve(&mime::scheme_mime(scheme)).as_deref() == Some(app.as_str()) {
-                0
-            } else {
-                1
-            }
-        }
-        _ => 1,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Drop-in command names
 // ---------------------------------------------------------------------------
+
+fn has_flag(args: &[String], flags: &[&str]) -> bool {
+    args.iter().any(|arg| flags.contains(&arg.as_str()))
+}
 
 fn print_xdg_open_usage() {
     println!("xdg-open - opens a file or URL in the user's preferred application");
@@ -519,31 +518,24 @@ fn print_xdg_open_usage() {
 }
 
 fn run_xdg_open(args: &[String]) -> i32 {
-    if args
-        .iter()
-        .any(|arg| arg == "--help" || arg == "-h" || arg == "--manual")
-    {
+    if has_flag(args, &["--help", "-h", "--manual"]) {
         print_xdg_open_usage();
         return 0;
     }
-    if args.iter().any(|arg| arg == "--version") {
-        println!("vesper {}", env!("CARGO_PKG_VERSION"));
+    if has_flag(args, &["--version"]) {
+        print_version();
         return 0;
     }
-    if args.len() != 1 {
+    let [target] = args else {
         eprintln!("xdg-open: must specify exactly one file or URL");
         print_xdg_open_usage();
         return 1;
-    }
+    };
 
-    let resolver = mime::Resolver::load();
-    match open::open_target(&args[0], None, LaunchMode::Replace, &resolver) {
-        Ok(()) => 0,
-        Err(err) => {
-            eprintln!("xdg-open: {}", err.message());
-            err.code()
-        }
-    }
+    exit_code(
+        "xdg-open",
+        open::open_target(target, None, LaunchMode::Replace, &Resolver::load()),
+    )
 }
 
 fn print_v_usage() {
@@ -551,12 +543,12 @@ fn print_v_usage() {
 }
 
 fn run_v(args: &[String]) -> i32 {
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if has_flag(args, &["--help", "-h"]) {
         print_v_usage();
         return 0;
     }
-    if args.iter().any(|arg| arg == "--version") {
-        println!("vesper {}", env!("CARGO_PKG_VERSION"));
+    if has_flag(args, &["--version"]) {
+        print_version();
         return 0;
     }
 
@@ -566,26 +558,22 @@ fn run_v(args: &[String]) -> i32 {
         return 1;
     }
 
-    let resolver = mime::Resolver::load();
+    let resolver = Resolver::load();
+    // A single target can take over this process; several need it to stay.
     let mode = if targets.len() == 1 {
         LaunchMode::Replace
     } else {
         LaunchMode::Spawn
     };
-    let mut failed = false;
 
+    let mut failed = false;
     for target in targets {
-        if let Err(err) = open::open_target(target.as_str(), None, mode, &resolver) {
-            eprintln!("v: {}", err.message());
+        if let Err(failure) = open::open_target(target, None, mode, &resolver) {
+            eprintln!("v: {}", failure.message);
             failed = true;
         }
     }
-
-    if failed {
-        1
-    } else {
-        0
-    }
+    i32::from(failed)
 }
 
 fn print_xdg_mime_usage() {
@@ -594,54 +582,39 @@ fn print_xdg_mime_usage() {
 }
 
 fn run_xdg_mime(args: &[String]) -> i32 {
-    match args.first().map(String::as_str) {
-        Some("--help") | Some("-h") => {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["--help" | "-h", ..] => {
             print_xdg_mime_usage();
             0
         }
-        Some("--version") => {
-            println!("vesper {}", env!("CARGO_PKG_VERSION"));
+        ["--version", ..] => {
+            print_version();
             0
         }
-        Some("query") => match args.get(1).map(String::as_str) {
-            Some("filetype") => match args.get(2) {
-                Some(file) => filetype_exit(file, "xdg-mime"),
-                None => {
-                    eprintln!("xdg-mime: query filetype needs a file");
-                    1
-                }
-            },
-            Some("default") => match args.get(2) {
-                Some(mime) => {
-                    let resolver = mime::Resolver::load();
-                    if let Some(id) = resolver.resolve(mime) {
-                        println!("{id}");
-                    }
-                    0
-                }
-                None => {
-                    eprintln!("xdg-mime: query default needs a MIME type");
-                    1
-                }
-            },
-            _ => {
-                print_xdg_mime_usage();
-                1
-            }
-        },
-        Some("default") => {
-            let Some(app) = args.get(1) else {
-                eprintln!("xdg-mime: default needs an application");
-                return 1;
-            };
-            let mimes: Vec<String> = args[2..].to_vec();
-            if mimes.is_empty() {
-                eprintln!("xdg-mime: default needs at least one MIME type");
-                return 1;
-            }
-            set_default_exit(app, &mimes, "xdg-mime", false)
+        ["query", "filetype", file, ..] => query_filetype(file, "xdg-mime"),
+        ["query", "filetype"] => {
+            eprintln!("xdg-mime: query filetype needs a file");
+            1
         }
-        Some("install") | Some("uninstall") => {
+        ["query", "default", mime, ..] => query_default(mime),
+        ["query", "default"] => {
+            eprintln!("xdg-mime: query default needs a MIME type");
+            1
+        }
+        ["default"] => {
+            eprintln!("xdg-mime: default needs an application");
+            1
+        }
+        ["default", _] => {
+            eprintln!("xdg-mime: default needs at least one MIME type");
+            1
+        }
+        ["default", app, mimes @ ..] => {
+            let mimes: Vec<String> = mimes.iter().map(|mime| mime.to_string()).collect();
+            exit_code("xdg-mime", mime::set_default(app, &mimes))
+        }
+        ["install" | "uninstall", ..] => {
             eprintln!("xdg-mime: install and uninstall are not supported");
             1
         }
@@ -661,22 +634,23 @@ fn print_xdg_settings_usage() {
 }
 
 fn run_xdg_settings(args: &[String]) -> i32 {
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if has_flag(args, &["--help", "-h"]) {
         print_xdg_settings_usage();
         return 0;
     }
 
-    let verb = args.first().map(String::as_str);
-    let property = args.get(1).map(String::as_str);
-    let rest: Vec<String> = args.iter().skip(2).cloned().collect();
-
-    match (verb, property) {
-        (Some("get"), Some(property)) => settings_get(property, &rest, "xdg-settings"),
-        (Some("set"), Some(property)) => settings_set(property, &rest, "xdg-settings"),
-        (Some("check"), Some(property)) => settings_check(property, &rest),
+    let verb = match args.first().map(String::as_str) {
+        Some("get") => SettingsVerb::Get,
+        Some("set") => SettingsVerb::Set,
+        Some("check") => SettingsVerb::Check,
         _ => {
             print_xdg_settings_usage();
-            1
+            return 1;
         }
-    }
+    };
+    let [_, property, rest @ ..] = args else {
+        print_xdg_settings_usage();
+        return 1;
+    };
+    settings(verb, property, rest, "xdg-settings")
 }

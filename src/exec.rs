@@ -101,7 +101,6 @@ fn expand_token(
         }
     }
 
-    // Drop tokens that consisted only of field codes expanding to nothing
     if out.is_empty() && had_code {
         Vec::new()
     } else {
@@ -109,7 +108,6 @@ fn expand_token(
     }
 }
 
-/// Build the command to execute from an entry's Exec field.
 pub fn build_command(
     entry: &DesktopEntry,
     file_args: &[String],
@@ -130,8 +128,7 @@ pub fn build_command(
     Ok((program, expanded))
 }
 
-/// True if the Exec value contains the given field code.
-pub fn has_field_code(exec: &str, code: char) -> bool {
+fn has_field_code(exec: &str, code: char) -> bool {
     let mut chars = exec.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
@@ -145,47 +142,48 @@ pub fn has_field_code(exec: &str, code: char) -> bool {
     false
 }
 
-/// Route extra arguments to file or URL field codes. Returns
-/// `(file_args, url_args, dropped)`, where `dropped` are the arguments that
-/// match no placeholder.
-pub fn route_extra_args(
-    exec: &str,
-    extra_args: &[String],
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+/// Arguments sorted by the field codes that will receive them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Routed {
+    pub files: Vec<String>,
+    pub urls: Vec<String>,
+    /// Arguments that no field code takes.
+    pub dropped: Vec<String>,
+}
+
+/// Route arguments to the file or URL field codes of `exec`. An Exec with
+/// only one kind of code receives the arguments either way; `are_urls`
+/// decides when it has both.
+pub fn route_args(exec: &str, args: &[String], are_urls: bool) -> Routed {
     let wants_files = has_field_code(exec, 'f') || has_field_code(exec, 'F');
     let wants_urls = has_field_code(exec, 'u') || has_field_code(exec, 'U');
+    let takes_many = has_field_code(exec, 'F') || has_field_code(exec, 'U');
 
-    let (file_args, url_args) = if wants_urls && !wants_files {
-        (Vec::new(), extra_args.to_vec())
+    let (files, urls) = if wants_urls && (are_urls || !wants_files) {
+        (Vec::new(), args.to_vec())
     } else {
-        (extra_args.to_vec(), Vec::new())
+        (args.to_vec(), Vec::new())
     };
 
-    let dropped = if has_field_code(exec, 'F') || has_field_code(exec, 'U') {
+    let dropped = if takes_many {
         Vec::new()
     } else if wants_files || wants_urls {
-        extra_args.get(1..).unwrap_or(&[]).to_vec()
+        args.get(1..).unwrap_or(&[]).to_vec()
     } else {
-        extra_args.to_vec()
+        args.to_vec()
     };
 
-    (file_args, url_args, dropped)
+    Routed {
+        files,
+        urls,
+        dropped,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-
-    fn test_entry(exec: &str) -> DesktopEntry {
-        let mut raw = BTreeMap::new();
-        raw.insert("Type".into(), "Application".into());
-        raw.insert("Name".into(), "Test App".into());
-        raw.insert("Exec".into(), exec.into());
-
-        DesktopEntry::new(PathBuf::from("/tmp/test.desktop"), raw, "test".into())
-    }
+    use crate::test_support::test_entry;
 
     fn strings(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -220,13 +218,13 @@ mod tests {
     fn url_field_codes_receive_extra_args_as_urls() {
         let entry = test_entry("browser %u");
         let extra = vec!["https://example.com".to_string()];
-        let (file_args, url_args, dropped) = route_extra_args(entry.exec().unwrap(), &extra);
+        let routed = route_args(entry.exec().unwrap(), &extra, false);
 
-        assert!(file_args.is_empty());
-        assert_eq!(url_args, extra);
-        assert!(dropped.is_empty());
+        assert!(routed.files.is_empty());
+        assert_eq!(routed.urls, extra);
+        assert!(routed.dropped.is_empty());
 
-        let (program, args) = build_command(&entry, &file_args, &url_args).unwrap();
+        let (program, args) = build_command(&entry, &routed.files, &routed.urls).unwrap();
         assert_eq!(program, "browser");
         assert_eq!(args, vec!["https://example.com"]);
     }
@@ -276,9 +274,18 @@ mod tests {
     #[test]
     fn reports_dropped_args() {
         let args = strings(&["a", "b"]);
-        assert_eq!(route_extra_args("prog", &args).2, args);
-        assert_eq!(route_extra_args("prog %f", &args).2, strings(&["b"]));
-        assert!(route_extra_args("prog %U", &args).2.is_empty());
-        assert_eq!(route_extra_args("prog %%f", &args).2, args);
+        assert_eq!(route_args("prog", &args, false).dropped, args);
+        assert_eq!(route_args("prog %f", &args, false).dropped, strings(&["b"]));
+        assert!(route_args("prog %U", &args, false).dropped.is_empty());
+        assert_eq!(route_args("prog %%f", &args, false).dropped, args);
+    }
+
+    #[test]
+    fn urls_prefer_url_codes_and_fall_back_to_file_codes() {
+        let url = strings(&["https://example.com"]);
+        assert_eq!(route_args("app %f %u", &url, true).urls, url);
+        assert_eq!(route_args("app %f %u", &url, false).files, url);
+        assert_eq!(route_args("app %f", &url, true).files, url);
+        assert_eq!(route_args("app %U", &url, false).urls, url);
     }
 }

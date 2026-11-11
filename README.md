@@ -138,7 +138,8 @@ The resolver reads `mimeapps.list` files in this order, per desktop name in
 4. `$XDG_DATA_DIRS/applications/$desktop-mimeapps.list`, then the generic file
 5. the deprecated `defaults.list` files
 
-The first `[Default Applications]` entry wins. `[Added Associations]` builds
+The first `[Default Applications]` entry that names an installed desktop
+entry wins. `[Added Associations]` builds
 the fallback list. `[Removed Associations]` in a higher-priority file removes
 associations from lower-priority files. `mimeinfo.cache` is not read: the
 resolver scans `MimeType=` on discovered entries instead, so stale caches
@@ -186,7 +187,8 @@ default through home-manager instead.
 
 ## Exit codes
 
-`open`, `v`, and `xdg-open` follow the xdg-open codes:
+`open` and `xdg-open` follow the xdg-open codes. `v` exits 1 if any target
+fails:
 
 | Code | Meaning |
 |------|---------|
